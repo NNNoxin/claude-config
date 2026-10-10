@@ -1303,6 +1303,10 @@ block = """<!-- BEGIN cloud-setup -->
 - 仓库根目录有 `.chat-export-on` 时，每次回复结束后 Stop hook 会运行 `chat-export`，把对话转成 `chat-logs/` 下的 HTML 和 Markdown 并自动提交推送（这个提交发生在回复之后，汇报里写“对话记录将在回复后自动更新”即可）。
 - 用户在某个项目里说“开启对话记录”时：先确认仓库是私有的（公开仓库要提醒用户并等确认），再创建 `.chat-export-on`，提交并推送。
 
+## 配置的源头
+
+- 这些全局规则、Skill、hook 和命令都由 https://github.com/NNNoxin/claude-config 的 `setup.sh` 安装。用户要求修改这些配置时，改那个仓库的 `setup.sh` 并推送，不要只改本机文件（本机改动在新环境里会丢）。
+
 ## 调研
 
 - 做网络调研前先用 research-toolkit Skill（新会话先运行 `research-init`）。
