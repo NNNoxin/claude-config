@@ -720,6 +720,7 @@ th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertic
 .md{overflow-wrap:anywhere}
 .md.plain{white-space:pre-wrap}
 .md table{display:table}
+.md td{min-width:4.5em}
 ul.req{margin:0;padding-left:20px}
 .hidden{display:none}
 """
