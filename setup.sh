@@ -1323,6 +1323,7 @@ except Exception:
 
 HOME = os.path.expanduser("~")
 LOCK = os.path.join(HOME, ".agent-reach", "logs", "chat-export.lock")  # 和 chat-export、research-site 共用，避免同时操作 git
+REPORT_LOCK = os.path.join(HOME, ".aris", "report.lock")  # 生成看板时排队
 REVIEWER_ENV = os.path.join(HOME, ".aris", "reviewer.env")
 VENV_PY = os.path.join(HOME, ".aris-venv", "bin", "python")
 MARK = ".aris-lab.json"
@@ -1385,23 +1386,26 @@ def load_json(path, default=None):
         return default
 
 
-def save_json(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+def atomic_write(path, text):
+    """先写到同目录的临时文件再整体替换：别的进程读到的永远是完整的旧文件或新文件。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=1)
-        f.write("\n")
+        f.write(text)
     os.replace(tmp, path)
+
+
+def save_json(path, obj):
+    atomic_write(path, json.dumps(obj, ensure_ascii=False, indent=1) + "\n")
 
 
 def write_if_changed(path, text):
     old = None
     if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:  # 文件坏了也能读，随后会被重写
             old = f.read()
     if old != text:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
+        atomic_write(path, text)
 
 
 def natkey(s):
@@ -1911,7 +1915,7 @@ def cmd_run(a):
         if p:
             rec.update(pid=os.getpid(), child_pid=p.pid, boot_id=boot_id())  # 用 aris-lab 自己的进程判断是否还在跑
             save_json(rec_path, rec)
-            build_reports(proj)
+            try_build_reports(proj)
 
             def stop(signum, frame):
                 state["status"] = "killed"
@@ -1965,7 +1969,7 @@ def cmd_run(a):
     for k in ("pid", "child_pid", "boot_id"):
         rec.pop(k, None)
     save_json(rec_path, rec)
-    build_reports(proj)
+    try_build_reports(proj)
 
     shown = metric_keys([rec], key_metrics(meta))[:4]
     key = ", ".join(f"{k}={fmt_num(rec['metrics'][k])}" for k in shown)
@@ -2263,13 +2267,25 @@ def build_index(exp_dir):
 
 
 def build_reports(proj):
-    meta = load_json(os.path.join(proj, MARK), {})
-    runs = load_runs(proj)
-    write_if_changed(os.path.join(proj, "DASHBOARD.md"), render_md(proj, meta, runs) + "\n")
-    write_if_changed(os.path.join(proj, "DASHBOARD.html"), render_html(proj, meta, runs))
-    exp_dir = os.path.dirname(proj)
-    if os.path.basename(exp_dir) == "experiments":
-        build_index(exp_dir)
+    """重新生成本项目看板和 experiments/ 总览。加锁排队，免得并行运行同时改同一个文件。"""
+    os.makedirs(os.path.dirname(REPORT_LOCK), exist_ok=True)
+    with open(REPORT_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        meta = load_json(os.path.join(proj, MARK), {})
+        runs = load_runs(proj)
+        write_if_changed(os.path.join(proj, "DASHBOARD.md"), render_md(proj, meta, runs) + "\n")
+        write_if_changed(os.path.join(proj, "DASHBOARD.html"), render_html(proj, meta, runs))
+        exp_dir = os.path.dirname(proj)
+        if os.path.basename(exp_dir) == "experiments":
+            build_index(exp_dir)
+
+
+def try_build_reports(proj):
+    """跑实验途中更新看板：出错只提示，不能让实验本身的记录跟着失败。"""
+    try:
+        build_reports(proj)
+    except Exception as e:
+        say(f"[aris-lab] ⚠️ 看板没更新成功（{type(e).__name__}: {e}），稍后运行 aris-lab report 重试", file=sys.stderr)
 
 
 def cmd_report(a):
