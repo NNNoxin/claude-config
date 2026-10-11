@@ -1658,6 +1658,7 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 logs/*.prev
+result.json
 *.tmp
 """
 
@@ -1727,7 +1728,7 @@ LLM_API_KEY=你的 Key
 
 ## 常用命令（Claude 会自己用，你也可以在终端里用）
 
-`check` 和 `new` 在仓库里任何位置都能运行；其余命令要在项目文件夹里运行：先 `cd experiments/<名字>/`（或者加 `--project experiments/<名字>`）。命令里的路径（比如 `src/train.py`）也是相对项目文件夹的。
+`check` 和 `new` 在仓库里任何位置都能运行；其余命令要在项目文件夹里运行：先 `cd experiments/<名字>/`（或者加 `--project experiments/<名字>`）。`aris-lab run` 总是在项目文件夹里执行你的命令，所以命令里的路径（比如 `src/train.py`、`.venv/bin/python`）都写成相对项目文件夹的。
 
 | 命令 | 作用 |
 |---|---|
@@ -1749,9 +1750,9 @@ LLM_API_KEY=你的 Key
 ## 实验脚本的约定
 
 - 超参数都用命令行参数（argparse），随机种子可以设置。
-- 结果写进环境变量 `ARIS_RESULT_FILE` 指向的 JSON：`{"metrics": {"acc": 0.93}, "config": {"lr": 0.001}}`。这个环境变量只有用 `aris-lab run` 启动时才有，脚本里写成 `os.environ.get("ARIS_RESULT_FILE", "result.json")`，直接运行调试也不会出错。
+- 结果写进环境变量 `ARIS_RESULT_FILE` 指向的 JSON：`{"metrics": {"acc": 0.93}, "config": {"lr": 0.001}}`。这个环境变量只有用 `aris-lab run` 启动时才有，脚本里写成 `os.environ.get("ARIS_RESULT_FILE", "result.json")`，直接运行调试也不会出错（`result.json` 已在 `.gitignore` 里，不会被提交）。
 - 可选：JSON 里加 `"group": "配置名"`，效果和 `--group` 一样。
-- 依赖装在项目自己的环境里：`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`，运行时写 `-- .venv/bin/python src/train.py`（`.venv` 不进 git）。
+- 依赖写进项目里的 `requirements.txt`（`aris-lab new` 已建好，每行一个），装在项目自己的环境里：`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`；运行时写 `-- .venv/bin/python src/train.py`（`.venv` 不进 git）。
 - 评估用数据集自带的真实标签，不能拿别的模型的输出当标准答案。
 - 数据集、模型权重、checkpoint 不进 git；结果、日志、看板进 git。
 """
@@ -1769,6 +1770,12 @@ EXP_HEADER = """# 🧪 实验区（ARIS 自动跑实验）
 
 GUIDE_BLOCK = "<!-- BEGIN aris-lab guide -->\n" + EXP_GUIDE + "<!-- END aris-lab guide -->"
 EXP_README = EXP_HEADER + GUIDE_BLOCK + "\n"
+
+
+REQUIREMENTS = """# 这个实验项目的 Python 依赖，每行一个，最好写死版本，例如：
+# numpy==2.1.0
+# scikit-learn==1.5.2
+"""
 
 
 def fill(tpl, **kw):
@@ -1798,7 +1805,7 @@ def cmd_new(a):
     save_json(os.path.join(proj, MARK), meta)
     kw = dict(TITLE=title, NAME=name, QUESTION=question, HARDWARE=hw, NOW=now("%Y-%m-%d %H:%M"))
     for fn, tpl in (("CLAUDE.md", CLAUDE_MD), ("README.md", README_MD), ("EXPERIMENT_LOG.md", LOG_MD),
-                    (".gitignore", GITIGNORE)):
+                    (".gitignore", GITIGNORE), ("requirements.txt", REQUIREMENTS)):
         path = os.path.join(proj, fn)
         if not os.path.exists(path):
             with open(path, "w", encoding="utf-8") as f:
@@ -1817,7 +1824,7 @@ def cmd_new(a):
     print("下一步：")
     print(f"  1. cd {rel}")
     print("  2. 写实验计划：/experiment-plan \"你的想法\"（或手写 refine-logs/EXPERIMENT_PLAN.md）")
-    print("  3. 跑计划：/experiment-bridge；单次运行用 aris-lab run R001 --milestone M0 -- python src/xxx.py")
+    print("  3. 跑计划：/experiment-bridge；单次运行用 aris-lab run R001 --milestone M0 -- .venv/bin/python src/xxx.py（没建 .venv 就写 python3）")
 
 
 # ---------- 跑实验 ----------
@@ -1882,7 +1889,7 @@ def cmd_run(a):
     dirty = bool(git(repo, "status", "--porcelain", "--", *code_paths).stdout.strip()) if repo else False
     hw, _ = hardware()
     rec = {"run_id": rid, "milestone": a.milestone or "", "desc": a.desc or "", "group": a.group or "",
-           "command": shlex.join(cmd), "workdir": os.path.relpath(os.getcwd(), proj),
+           "command": shlex.join(cmd), "workdir": ".",
            "status": "running", "exit_code": None, "started": now(), "finished": None, "duration_s": None,
            "host": socket.gethostname(), "hardware": hw, "git_commit": head, "code_dirty": dirty,
            "log": log_rel, "result_file": res_rel, "metrics": {}, "config": {}, "note": ""}
@@ -1894,7 +1901,7 @@ def cmd_run(a):
         log.write(f"# aris-lab run {rid} · {rec['started']} · {rec['command']}\n")
         log.flush()
         try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+            p = subprocess.Popen(cmd, cwd=proj, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                                  start_new_session=True, text=True, errors="replace", bufsize=1)
         except OSError as e:
             log.write(f"无法启动命令：{e}\n")
@@ -2087,7 +2094,7 @@ def render_md(proj, meta, runs):
         L.append("")
     L += ["## 全部运行", ""]
     if not runs:
-        L += ["还没有运行。用 `aris-lab run R001 --milestone M0 --desc \"健全性检查\" -- python src/xxx.py` 开始。", ""]
+        L += ["还没有运行。在这个文件夹里用 `aris-lab run R001 --milestone M0 --desc \"健全性检查\" -- .venv/bin/python src/xxx.py` 开始。", ""]
     by_ms = {}
     for r in runs:
         by_ms.setdefault(r.get("milestone") or "未分组", []).append(r)
