@@ -23,6 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/NNNoxin/claude-config/main/setup.sh
 | [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep) 的 22 个 Skill | 自动跑实验：写实验计划、写代码、审代码、先小测试再正式跑、汇总结果、多轮审稿改进（`/experiment-plan`、`/experiment-bridge`、`/auto-review-loop` 等） |
 | `aris-lab` | 实验项目工具：新建项目、跑实验并记录日志和指标、生成看板（Markdown + 网页）、提交推送、体检 |
 | `llm-chat` MCP | ARIS 的审稿模型：任意 OpenAI 兼容 API（魔搭、DeepSeek、OpenRouter 等），Key 从环境变量读取 |
+| `aris-reviewer` 子代理 | 没配外部审稿模型时，用另一个 Claude 模型（Sonnet）+ 专门的审稿提示做只读审稿；和写代码的 Claude 同一家，只算临时审稿 |
 
 ## 在 claude.ai/code 云端使用
 
@@ -75,7 +76,7 @@ curl -fsSL https://raw.githubusercontent.com/NNNoxin/claude-config/main/setup.sh
 | OpenRouter | `openrouter` | 一个 Key 用多家模型 |
 | OpenAI / Gemini / Kimi / 智谱 / 通义 / 硅基流动 | `openai` / `gemini` / `moonshot` / `zhipu` / `dashscope` / `siliconflow` | 再加 `LLM_MODEL=模型名` |
 
-然后 `LLM_API_KEY=你的 Key`。不配也能跑，结果会标注“未经外部审稿”。
+然后 `LLM_API_KEY=你的 Key`。不配也能跑：这时由 `aris-reviewer` 子代理（另一个 Claude 模型，只读）做**同家族临时审稿**，能抓出不少 bug，但和写代码的 Claude 盲点可能相似，正式结论建议再用外部审稿模型复核。
 
 **GPU**：云端容器没有 GPU，网络只放行 HTTPS（不能 SSH 到服务器，也连不上 Modal），适合 CPU 小实验和调大模型 API 的评测。
 要训练模型，就在有 GPU 的机器上：装 Claude Code → 运行上面的一键命令 → `git clone` 你的仓库 → 在仓库里运行 `claude remote-control`，

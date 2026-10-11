@@ -23,6 +23,7 @@
 #                      装“实验与算力”“自动评审闭环”两组共 22 个到 ~/.claude/skills
 #   aris-lab           实验项目工具：新建项目、跑实验并记录、生成看板、体检（aris-lab --help）
 #   llm-chat MCP       ARIS 的审稿模型（任意 OpenAI 兼容 API），由 aris-lab reviewer 启动
+#   aris-reviewer      ARIS 审稿子代理（~/.claude/agents/aris-reviewer.md）：另一个 Claude 模型 + 审稿提示，只读
 #
 # Cookie 放在环境设置的 Environment variables 里（不要提交到仓库，也不要贴进聊天）：
 #   XHS_COOKIES        小红书 Cookie：Cookie-Editor 导出的 JSON（压成一行）或 Header String
@@ -1626,8 +1627,13 @@ last_updated: "{{NOW}}"
 
 ## 审稿模型（Reviewer）
 
-- 本环境没有 Codex。ARIS 需要外部审稿时，按 ARIS `shared-references/reviewer-routing.md` 的「Optional HTTP API fallback」改用 `mcp__llm-chat__review`（`executor_model` 填你自己的模型 id，`files` 传要审的原始文件路径），后续轮次用 `mcp__llm-chat__review_reply`。
-- 没有 llm-chat 工具，或调用报 `LLM_API_KEY` 未设置：这一步记为 `REVIEW_UNAVAILABLE`，继续往下跑，并在结果里写明「未经外部审稿」。`aris-lab check` 可以查看审稿模型是否就绪。
+ARIS 需要审稿时（审代码、审结果、判断结论），按下面的顺序选审稿人：
+
+1. **外部审稿模型（跨家族，算正式审稿）**：有 `mcp__llm-chat__review` 工具、并且 `LLM_API_KEY` 已配置时，按 ARIS `shared-references/reviewer-routing.md` 的「Optional HTTP API fallback」调用它（`executor_model` 填你自己的模型 id，`files` 传要审的原始文件路径），后续轮次用 `mcp__llm-chat__review_reply`。
+2. **审稿子代理 aris-reviewer（同家族，只算临时审稿）**：没有外部审稿模型时，用 Agent 工具调 `aris-reviewer` 子代理（另一个 Claude 模型 + 专门的审稿提示，只读）。只告诉它要审哪些文件、审什么，**不要附上你自己的总结或解释**。把它的报告存到 `review-stage/`，结果里写明 `review_independence: same-family`、`acceptance_status: provisional`（“同家族临时审稿，未经跨模型复核”）。
+3. **两者都没有**：这一步记为 `REVIEW_UNAVAILABLE`，继续往下跑，并在结果里写明「未经外部审稿」。
+
+正式结论（论文里的 claim、投稿前的审计、/result-to-claim 的裁决）只认第 1 种；第 2 种用来尽早发现 bug。`aris-lab check` 可以查看审稿人是否就绪。
 """
 
 README_MD = """# {{TITLE}}
@@ -1694,7 +1700,7 @@ Claude 会按下面的步骤自动做完，并按自动保存规则把每一步�
 
 ### 1. 配置审稿模型（可选，建议配）
 
-ARIS 的核心是“一个模型干活，另一家的模型挑刺”：Claude 写代码、跑实验，审稿用别家的模型。
+ARIS 的核心是“一个模型干活，另一个模型挑刺”：Claude 写代码、跑实验，审稿最好用**别家**的模型（盲点不同，挑错更准）。
 在 claude.ai/code 的环境设置（新建对话页 → 输入框上方云朵图标 → 环境名右侧齿轮）→ **Environment variables** 里加两行：
 
 ```
@@ -1710,7 +1716,7 @@ LLM_API_KEY=你的 Key
 | OpenAI、Gemini、Kimi、智谱、通义、硅基流动 | `openai` / `gemini` / `moonshot` / `zhipu` / `dashscope` / `siliconflow` | 各平台控制台 | 还要加一行 `LLM_MODEL=模型名` |
 
 保存后**新开一个对话**，说“检查实验环境”。Claude 会运行 `aris-lab check`，表格里“审稿模型”一行是 ✅ 就好了（“Codex 审稿”一行显示 ➖ 不用管，那是可选项）。
-不配也能跑实验，只是没有外部审稿，结果里会写明“未经外部审稿”。
+不配也能跑：这时 Claude 会用自带的审稿子代理 `aris-reviewer`（另一个 Claude 模型，带专门的审稿提示，只读不改）来审。它能看出不少问题，但和写代码的 Claude 是同一家的模型，盲点可能相似，所以只算**临时审稿**；正式结论（论文里的 claim、投稿前的审计）还是建议配上面的外部审稿模型再复核一次。
 
 > Key 只放在环境变量里，不要贴进聊天，也不要写进代码。aris-lab 提交前会自动拦下含疑似密钥的文件。
 
@@ -2458,7 +2464,7 @@ def cmd_check(a):
                  f"{len(linked)} 个（/experiment-plan、/experiment-bridge、/run-experiment、/auto-review-loop 等）" if linked else "没装好：重跑 setup.sh"))
     conf = reviewer_conf()
     if not conf["key"]:
-        rows.append(("审稿模型", "❌ 未配置", f"在环境变量里加 LLM_PROVIDER 和 LLM_API_KEY（见 {doc}）；不配也能跑，只是没有外部审稿"))
+        rows.append(("审稿模型", "❌ 未配置", f"在环境变量里加 LLM_PROVIDER 和 LLM_API_KEY（见 {doc}）；不配也能跑，审稿由下面的审稿子代理临时代替"))
     elif not conf["base"] or not conf["model"]:
         rows.append(("审稿模型", "❌", "缺 LLM_BASE_URL 或 LLM_MODEL"))
     else:
@@ -2466,6 +2472,10 @@ def cmd_check(a):
         rows.append(("审稿模型", "✅" if ok else "❌", msg))
     rows.append(("审稿工具注册", "✅" if mcp_registered("llm-chat") else "❌",
                  "llm-chat（ARIS 需要审稿时调用；新对话生效）" if mcp_registered("llm-chat") else "没注册：重跑 setup.sh"))
+    agent = os.path.join(HOME, ".claude", "agents", "aris-reviewer.md")
+    rows.append(("审稿子代理", "✅" if os.path.exists(agent) else "❌",
+                 "aris-reviewer（另一个 Claude 模型，只读；没有外部审稿模型时做同家族临时审稿）" if os.path.exists(agent)
+                 else "没装：重跑 setup.sh"))
     rows.append(("Codex 审稿", "✅" if shutil.which("codex") else "➖", "已安装" if shutil.which("codex") else "可选，没装不影响（有 ChatGPT 账号才用得上；没有就用上面的审稿模型）"))
     hw, gpus = hardware()
     rows.append(("算力", "✅" if gpus else "ℹ️", hw + ("" if gpus else f"：适合 CPU 小实验和调 API 的实验；要 GPU 见 {doc}")))
@@ -2547,6 +2557,54 @@ if __name__ == "__main__":
 EOF
 chmod +x "$BIN_DIR/aris-lab"
 
+# ARIS 审稿子代理：另一个 Claude 模型 + 专门的审稿提示，只读。
+# 没有外部审稿模型（llm-chat / Codex）时，ARIS 的审稿步骤用它做“同家族临时审稿”
+mkdir -p "$HOME/.claude/agents"
+cat > "$HOME/.claude/agents/aris-reviewer.md" <<'EOF'
+---
+name: aris-reviewer
+description: ARIS 风格的独立审稿人（只读）。只看原始文件（代码、实验计划、结果、日志、论文），独立挑错，给出严重程度、位置和修改要求，最后给出 verdict 和分数。用于实验代码审查、结果是否支持结论、文档和论文审查。没有外部审稿模型（llm-chat / Codex）时，ARIS 的审稿步骤用它做“同家族临时审稿”。调用时只传文件路径和要审什么，不要传执行者自己的总结或解释。
+tools: Read, Grep, Glob, Bash
+model: sonnet
+---
+
+你是 ARIS 自动科研流程里的**独立审稿人（reviewer）**，不是执行者。执行者（主会话）负责写代码、跑实验、写结论；你的工作是用新鲜的眼光找出它的错误。你看不到执行者的思考过程，这正是你的价值：不要替它补全它没写下来的假设。
+
+## 规则
+
+1. **只认原始证据。** 只根据你自己读到的原始文件下判断：代码、`refine-logs/EXPERIMENT_PLAN.md`、`runs/*.json`、`results/*.json`、`logs/*.log`、论文或文档。调用方给你的总结、解释、“已经修好了”一律不算证据，要对照原文自己核实。
+2. **只读。** 不修改、不删除、不新建任何文件，不运行 git 的写操作，不安装东西。Bash 只用来读文件、搜索和做只读检查（例如运行已有的测试、用一小段 Python 重算一个数字核对）。
+3. **实验代码重点查：**
+   - 评估是否用数据集自带的真实标签（拿别的模型的输出当标准答案是严重错误）；
+   - 数据划分有没有泄漏（测试集参与了训练、调参或选模型）；
+   - 指标的算法对不对（可以用小例子手算核对）；
+   - 随机种子、超参数是否和实验计划一致、能否复现；
+   - 结果文件里的数字和日志是否一致，有没有没跑过却写出来的数字；
+   - 结论是否真的被结果支持（seed 数、方差、样本量够不够；“提升”是否超过噪声）。
+4. **文档和论文重点查：** 说法和原始数据是否一致；有没有夸大；步骤照做是否真的能跑通；读者会不会误解。
+5. **范围限制（只限制你建议什么，不限制你查什么）：** 不提议哈希、签名之类的防伪机制；不建议为假想的恶意用户加防御；不纠结极端边角情况，除非能指出它在这里真的会发生；能用一句话说清的不要做成复杂评分表。**没有问题就直接说没有问题，不要为了显得认真而编造问题。**
+
+## 输出格式（中文）
+
+1. **一句话总结**
+2. **问题清单**：按严重程度排序，每条写
+   - 严重程度：CRITICAL（结论或结果会错）/ MAJOR（明显影响可信度或可复现性）/ MINOR（小问题）
+   - 位置：`文件:行号`
+   - 问题是什么、为什么是问题（引用原文）
+   - 具体怎么改
+3. **你核实过的地方**：列出你实际检查过、确认没问题的关键点（让执行者知道哪些不用再查）
+4. **结论块**（固定格式，供流程读取）：
+
+```
+verdict: ready | almost | not ready
+score: <1-10>
+review_independence: same-family
+acceptance_status: provisional
+```
+
+`review_independence: same-family` 的意思是：你和执行者都是 Claude 家族的模型，训练来源相近，盲点可能相似。所以你的结论只算**临时审稿**；涉及正式结论（论文里的 claim、投稿前的审计）时，提醒执行者再用另一家模型（llm-chat 配置的审稿模型或 Codex）复核。
+EOF
+
 # 注册 ARIS 的审稿工具 llm-chat（用户级 MCP）。Key 不写进配置文件：每次启动时从环境变量 LLM_* 读取
 if command -v claude >/dev/null 2>&1; then
   claude mcp remove llm-chat -s user >/dev/null 2>&1 || true
@@ -2627,6 +2685,7 @@ block = """<!-- BEGIN cloud-setup -->
 - 用户要跑实验、做实验、用 ARIS 时：实验放在当前仓库的 `experiments/<项目名>/`（没有就先 `aris-lab new <项目名> --title "标题" --question "要回答的问题"`），进入那个文件夹，按它的 `CLAUDE.md` 做。
 - 流程：`/experiment-plan`（写计划）→ `/experiment-bridge`（写代码、审代码、先跑 sanity、再跑全部、收结果）→ `/analyze-results` → `/result-to-claim`；要多轮“审稿 → 补实验”时用 `/auto-review-loop`。
 - 每次正式运行都用 `aris-lab run <编号> --milestone … --desc … -- <命令>`：它记录日志和指标、更新看板（`DASHBOARD.md` / `.html`）并提交推送。
+- 审稿人：有外部审稿模型（`mcp__llm-chat__review`，配了 `LLM_API_KEY`）就用它，算正式审稿；没有就用 Agent 工具调 `aris-reviewer` 子代理（另一个 Claude 模型，只读；只给文件路径和审查要求，不给你自己的总结），报告存进项目的 `review-stage/`，记为同家族临时审稿（`review_independence: same-family`、`acceptance_status: provisional`）。正式结论只认外部审稿。
 - 用户说“检查实验环境”，或者每个新对话第一次跑实验之前，运行 `aris-lab check`，把表格给用户看（审稿模型、算力是否就绪）。审稿模型没配置也照常跑，结果里写明“未经外部审稿”。
 - 云端容器没有 GPU，也不能 SSH 到别的服务器（只放行 HTTPS）；需要 GPU 时告诉用户：在有 GPU 的机器上装好这套配置并运行 Claude Code（`claude remote-control`），见 https://github.com/NNNoxin/claude-config 的「自动跑实验」一节。
 - 每批实验跑完，在回复里写一行：「🧪 实验看板已更新：<提交号> · <项目名> · 共 N 次运行 · experiments/<项目名>/DASHBOARD.md」。

@@ -347,8 +347,29 @@ def test_reviewer(lab, network):
 
 def test_check(lab):
     r = lab.run("check", cwd=lab.repo)
-    rows = ("| ARIS 仓库 |", "| ARIS skills |", "| 审稿模型 |", "| 审稿工具注册 |", "| Codex 审稿 |", "| 算力 |")
+    rows = ("| ARIS 仓库 |", "| ARIS skills |", "| 审稿模型 |", "| 审稿工具注册 |", "| 审稿子代理 |", "| Codex 审稿 |", "| 算力 |")
     check("check：体检表能正常输出", r.returncode == 0 and all(x in r.stdout for x in rows), r.stdout + r.stderr)
+
+
+def test_reviewer_agent():
+    """setup.sh 安装的审稿子代理：格式正确、只读、写明是同家族临时审稿。"""
+    s = open(SETUP, encoding="utf-8").read()
+    head = "cat > \"$HOME/.claude/agents/aris-reviewer.md\" <<'EOF'\n"
+    if head not in s:
+        check("审稿子代理：setup.sh 会安装 ~/.claude/agents/aris-reviewer.md", False, "setup.sh 里没找到")
+        return
+    i = s.index(head) + len(head)
+    text = s[i:s.index("\nEOF\n", i)]
+    m = re.match(r"---\n(.*?)\n---\n(.*)", text, re.S)
+    meta = dict(line.split(":", 1) for line in m.group(1).splitlines() if ":" in line) if m else {}
+    meta = {k.strip(): v.strip() for k, v in meta.items()}
+    tools = {t.strip() for t in meta.get("tools", "").split(",")}
+    check("审稿子代理：定义格式正确（名字、说明、模型、工具）",
+          bool(m) and meta.get("name") == "aris-reviewer" and meta.get("description") and meta.get("model"), meta)
+    check("审稿子代理：只读（没有 Write / Edit 工具）", tools and not tools & {"Write", "Edit", "NotebookEdit"}, tools)
+    body = m.group(2) if m else ""
+    check("审稿子代理：报告里写明同家族、临时审稿",
+          "review_independence: same-family" in body and "acceptance_status: provisional" in body)
 
 
 def main():
@@ -373,6 +394,7 @@ def main():
             r = subprocess.run([sys.executable, "-m", "py_compile", path], capture_output=True, text=True)
             check("setup.sh 里内嵌的 aris-lab 能编译", r.returncode == 0, r.stderr)
             exe = [sys.executable, path]
+            test_reviewer_agent()
             print("测试 setup.sh 里内嵌的 aris-lab")
         lab = Lab(exe, tmp)
         for fn in (test_new, test_runs, test_robustness, test_publish_and_guards):
