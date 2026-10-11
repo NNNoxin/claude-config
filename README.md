@@ -19,7 +19,10 @@ curl -fsSL https://raw.githubusercontent.com/NNNoxin/claude-config/main/setup.sh
 | `chat-export` | 每次回复后把对话转成 HTML + Markdown，推送到仓库的 `chat-logs/`（需按仓库开启） |
 | `~/.claude/CLAUDE.md` 规则 | 每步自动 commit + push、每次回复末尾汇报更新内容、调研流程 |
 | `~/.claude/skills/research-toolkit` | 调研 Skill：每个网站怎么查 |
-| `~/.claude/settings.json` Stop hook | 回复结束后自动导出对话记录、补发布调研网站 |
+| `~/.claude/settings.json` Stop hook | 回复结束后自动导出对话记录、补发布调研网站、补提交实验记录 |
+| [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep) 的 22 个 Skill | 自动跑实验：写实验计划、写代码、审代码、先小测试再正式跑、汇总结果、多轮审稿改进（`/experiment-plan`、`/experiment-bridge`、`/auto-review-loop` 等） |
+| `aris-lab` | 实验项目工具：新建项目、跑实验并记录日志和指标、生成看板（Markdown + 网页）、提交推送、体检 |
+| `llm-chat` MCP | ARIS 的审稿模型：任意 OpenAI 兼容 API（魔搭、DeepSeek、OpenRouter 等），Key 从环境变量读取 |
 
 ## 在 claude.ai/code 云端使用
 
@@ -35,6 +38,11 @@ curl -fsSL https://raw.githubusercontent.com/NNNoxin/claude-config/main/setup.sh
    TWITTER_COOKIES=auth_token=...; ct0=...; ...
    ```
    用 Chrome 插件 Cookie-Editor 登录后 Export → Header String 导出，整行粘在等号后面。建议用小号。
+   要用 ARIS 审稿模型再加两行（见下面「自动跑实验」）：
+   ```
+   LLM_PROVIDER=modelscope
+   LLM_API_KEY=...
+   ```
 5. 保存，新开对话，说“**检查调研工具**”。
 
 > 云端环境会把 setup 的结果缓存约 7 天。本仓库更新后想马上生效：在对话里让 Claude 运行一次上面的 curl 命令，
@@ -52,6 +60,27 @@ curl -fsSL https://raw.githubusercontent.com/NNNoxin/claude-config/main/setup.sh
 - Cookie 用环境变量提供（写进 `~/.zshrc` 等），然后在 Claude Code 里说“检查调研工具”。
 - 在本机用 X / 推特不会被屏蔽（云服务器 IP 会被 X 拒绝）。
 
+## 自动跑实验（ARIS）
+
+对 Claude 说“**用 ARIS 跑实验：<你的想法>**”。Claude 会在当前仓库的 `experiments/<项目名>/` 里：
+写实验计划 → 写代码 → 审代码 → 先跑小测试 → 正式跑（多个随机种子）→ 生成看板 → 判断结果支持哪些结论，每一步都提交推送。
+第一次建项目时会生成 `experiments/README.md`，里面有完整的使用说明。新对话里说“**检查实验环境**”会运行 `aris-lab check`。
+
+**审稿模型**（可选，建议配）：ARIS 让另一家的模型来挑刺。在环境变量里加：
+
+| 用哪家 | `LLM_PROVIDER` | 说明 |
+|---|---|---|
+| 魔搭 ModelScope | `modelscope` | 免费额度（每天约 2000 次），Key 以 `ms-` 开头，要先绑定阿里云账号 |
+| DeepSeek | `deepseek` | 按量付费，便宜 |
+| OpenRouter | `openrouter` | 一个 Key 用多家模型 |
+| OpenAI / Gemini / Kimi / 智谱 / 通义 / 硅基流动 | `openai` / `gemini` / `moonshot` / `zhipu` / `dashscope` / `siliconflow` | 再加 `LLM_MODEL=模型名` |
+
+然后 `LLM_API_KEY=你的 Key`。不配也能跑，结果会标注“未经外部审稿”。
+
+**GPU**：云端容器没有 GPU，网络只放行 HTTPS（不能 SSH 到服务器，也连不上 Modal），适合 CPU 小实验和调大模型 API 的评测。
+要训练模型，就在有 GPU 的机器上：装 Claude Code → 运行上面的一键命令 → `git clone` 你的仓库 → 在仓库里运行 `claude remote-control`，
+然后在 Claude 网页或手机 App 里继续用，和云端一样。
+
 ## 在项目里开启对话记录
 
 对 Claude 说“**开启对话记录**”。Claude 会先确认仓库是私有的，再在仓库根目录创建 `.chat-export-on`。
@@ -65,4 +94,6 @@ curl -fsSL https://raw.githubusercontent.com/NNNoxin/claude-config/main/setup.sh
 | 小红书 | 用真账号搜索，频率太高有封号风险；Claude 会控制搜索次数和间隔 |
 | Reddit / linux.do / CSDN | 云端直连被封，经 Exa 中转；最新几小时的帖子可能搜不到 |
 | Discord | 不支持 |
+| GPU 实验 | 云端容器没有 GPU、不能 SSH；在 GPU 机器上运行 Claude Code（Remote Control） |
+| ARIS 审稿 | 默认的 Codex（GPT）审稿需要 ChatGPT 账号，这里改用 `llm-chat` + 任意 OpenAI 兼容 API |
 | 其他 AI 编程工具（Cursor、Codex 等） | 命令行工具都能用；`CLAUDE.md`、Skill、hook 是 Claude Code 专用格式 |

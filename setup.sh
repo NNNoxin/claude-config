@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Code 一键配置 —— 调研工具箱 + 自动保存 + 对话记录 + 调研档案馆
+# Claude Code 一键配置 —— 调研工具箱 + 自动保存 + 对话记录 + 调研档案馆 + 自动跑实验（ARIS）
 # 来源：https://github.com/NNNoxin/claude-config
 #
 # 用法（任选其一）：
@@ -19,10 +19,19 @@
 #   research-check     检查各网站是否可用，输出 Markdown 表格
 #   xhs-cookies-import / xhs-mcp-start  小红书辅助命令
 #   research-toolkit   Claude Skill（~/.claude/skills/research-toolkit），记录各网站怎么查
+#   ARIS               自动科研 Skill（wanshuiyin/Auto-claude-code-research-in-sleep，仓库在 ~/aris_repo），
+#                      装“实验与算力”“自动评审闭环”两组共 22 个到 ~/.claude/skills
+#   aris-lab           实验项目工具：新建项目、跑实验并记录、生成看板、体检（aris-lab --help）
+#   llm-chat MCP       ARIS 的审稿模型（任意 OpenAI 兼容 API），由 aris-lab reviewer 启动
 #
 # Cookie 放在环境设置的 Environment variables 里（不要提交到仓库，也不要贴进聊天）：
 #   XHS_COOKIES        小红书 Cookie：Cookie-Editor 导出的 JSON（压成一行）或 Header String
 #   TWITTER_COOKIES    推特 Cookie：同上；或者分别填 TWITTER_AUTH_TOKEN 和 TWITTER_CT0
+#
+# 审稿模型（可选；ARIS 用它审代码和结果，不填也能跑实验，只是没有外部审稿）：
+#   LLM_PROVIDER       modelscope / deepseek / openrouter / gemini / openai / siliconflow / dashscope / moonshot / zhipu
+#   LLM_API_KEY        对应平台的 API Key
+#   LLM_MODEL          可选：换审稿模型（gemini / openai 等没有默认模型的必须填）；LLM_BASE_URL 可选：自定义地址
 
 set -uo pipefail
 
@@ -32,6 +41,8 @@ AR_VENV="$HOME/.agent-reach-venv"
 XHS_SRC="$AR_HOME/tools/xiaohongshu-mcp"
 XHS_BIN="$AR_HOME/tools/bin/xiaohongshu-mcp"
 SKILL_DIR="$HOME/.claude/skills/research-toolkit"
+ARIS_DIR="$HOME/aris_repo"
+ARIS_VENV="$HOME/.aris-venv"
 
 # 命令装到哪：云端（root）用 /usr/local/bin；本机没有写权限时用 ~/.local/bin
 if [ -w /usr/local/bin ]; then BIN_DIR=/usr/local/bin; else BIN_DIR="$HOME/.local/bin"; fi
@@ -115,12 +126,28 @@ PY
   log "xiaohongshu-mcp done"
 }
 
+install_aris() {
+  log "installing ARIS"
+  export GIT_LFS_SKIP_SMUDGE=1
+  clone_or_update https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep.git "$ARIS_DIR" || return 1
+  [ -x "$ARIS_VENV/bin/pip" ] || python3 -m venv "$ARIS_VENV"
+  # ARIS 自带的 llm-chat 审稿服务要用 httpx
+  "$ARIS_VENV/bin/pip" install -q --disable-pip-version-check httpx pyyaml || return 1
+  # 只装“实验与算力”“自动评审闭环”两组（依赖会自动带上），装到用户级 ~/.claude/skills，所有项目都能用
+  (cd "$HOME" && bash "$ARIS_DIR/tools/install_aris.sh" "$HOME" --groups experiments,review-loop \
+     --skip-new --no-doc --no-agent-profiles --quiet </dev/null) || return 1
+  log "ARIS done"
+}
+
 install_agent_reach &
 pid_ar=$!
 install_xhs &
 pid_xhs=$!
+install_aris &
+pid_aris=$!
 wait "$pid_ar" || log "Agent Reach install failed"
 wait "$pid_xhs" || log "xiaohongshu-mcp install failed"
+wait "$pid_aris" || log "ARIS install failed"
 
 # ---------- 辅助命令 ----------
 
@@ -1264,6 +1291,1168 @@ if __name__ == "__main__":
 EOF
 chmod +x "$BIN_DIR/chat-export"
 
+# aris-lab：实验项目工具（新建项目、跑实验并记录、生成看板、体检；也负责启动审稿模型）
+cat > "$BIN_DIR/aris-lab" <<'EOF'
+#!/usr/bin/env python3
+"""aris-lab：配合 ARIS 自动跑实验的小工具。
+
+  aris-lab new 名字 [--title 标题] [--question 要回答的问题]
+        在 <当前仓库>/experiments/名字/ 新建实验项目（CLAUDE.md、目录结构、看板）
+  aris-lab run 编号 [--milestone M1] [--desc 说明] [--group 配置名] [--timeout 秒]
+               [--no-commit] [--force] -- 命令 参数...
+        跑一次实验：保存完整日志、记录指标、更新看板、提交并推送
+  aris-lab status                     列出本项目的所有运行
+  aris-lab report [--all]             重新生成看板（DASHBOARD.md / DASHBOARD.html / experiments/index.html）
+  aris-lab publish [-m 说明] [--auto]  提交并推送 experiments/ 的改动（--auto 给 Stop hook 用，没改动就静默退出）
+  aris-lab reviewer [--test]          查看审稿模型配置（环境变量 LLM_PROVIDER / LLM_API_KEY / LLM_BASE_URL / LLM_MODEL）
+  aris-lab check                      体检：ARIS、审稿模型、算力、Python 环境，输出表格
+
+实验脚本的约定：从环境变量 ARIS_RUN_ID、ARIS_RESULT_FILE 拿到运行编号和结果文件路径，
+把 {"metrics": {...}, "config": {...}} 写进 ARIS_RESULT_FILE；
+也可以在标准输出打印一行 `ARIS_RESULT {...JSON...}`（取最后一行）。
+"""
+import argparse, datetime as dt, fcntl, glob, html, json, math, os, re, shlex, shutil, signal
+import socket, statistics, subprocess, sys, threading, time
+from urllib import error as urlerror, request as urlrequest
+
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo(os.environ.get("CHAT_EXPORT_TZ", "Asia/Shanghai"))
+except Exception:
+    TZ = dt.timezone(dt.timedelta(hours=8))
+
+HOME = os.path.expanduser("~")
+LOCK = os.path.join(HOME, ".agent-reach", "logs", "chat-export.lock")  # 和 chat-export、research-site 共用，避免同时操作 git
+REVIEWER_ENV = os.path.join(HOME, ".aris", "reviewer.env")
+VENV_PY = os.path.join(HOME, ".aris-venv", "bin", "python")
+MARK = ".aris-lab.json"
+MAX_MB = 20
+STATUS = {"running": "⏳ 运行中", "done": "✅ 完成", "failed": "❌ 失败", "timeout": "⏱ 超时",
+          "killed": "⛔ 被中止", "lost": "❔ 中断"}
+# 审稿模型预设：LLM_PROVIDER → (LLM_BASE_URL, 默认 LLM_MODEL)；默认模型为空的必须自己填 LLM_MODEL
+PROVIDERS = {
+    "modelscope": ("https://api-inference.modelscope.cn/v1", "deepseek-ai/DeepSeek-V4-Pro"),
+    "deepseek": ("https://api.deepseek.com/v1", "deepseek-chat"),
+    "openrouter": ("https://openrouter.ai/api/v1", "deepseek/deepseek-v4-pro"),
+    "siliconflow": ("https://api.siliconflow.cn/v1", ""),
+    "dashscope": ("https://dashscope.aliyuncs.com/compatible-mode/v1", ""),
+    "moonshot": ("https://api.moonshot.cn/v1", ""),
+    "zhipu": ("https://open.bigmodel.cn/api/paas/v4", ""),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", ""),
+    "openai": ("https://api.openai.com/v1", ""),
+}
+
+
+# ---------- 小工具 ----------
+def now(fmt="%Y-%m-%d %H:%M:%S"):
+    return dt.datetime.now(TZ).strftime(fmt)
+
+
+def git(repo, *args, stdin=None, literal=False):
+    env = dict(os.environ, GIT_LITERAL_PATHSPECS="1") if literal else None
+    return subprocess.run(["git", "-C", repo, "-c", "core.quotePath=false", *args], capture_output=True,
+                          text=True, input=stdin, env=env)
+
+
+def git_root(path="."):
+    r = git(os.path.abspath(path), "rev-parse", "--show-toplevel")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def find_project(start=None):
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        if os.path.isfile(os.path.join(d, MARK)):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def need_project(a):
+    p = find_project(getattr(a, "project", None))
+    if not p:
+        sys.exit("不在实验项目里：先 cd experiments/<项目名>/，或者用 aris-lab new <项目名> 新建一个")
+    return p
+
+
+def load_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def write_if_changed(path, text):
+    old = None
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            old = f.read()
+    if old != text:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def natkey(s):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(s))]
+
+
+def fmt_num(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, float) and v.is_integer() and abs(v) < 1e15:
+        v = int(v)
+    if isinstance(v, int):
+        return f"{v:,}" if abs(v) >= 10000 else str(v)
+    if math.isnan(v) or math.isinf(v):
+        return str(v)
+    a = abs(v)
+    if a >= 1000:
+        return f"{v:,.1f}"
+    if a >= 1:
+        return f"{v:.3f}"
+    return f"{v:.4f}"
+
+
+def fmt_dur(s):
+    if s is None:
+        return ""
+    s = float(s)
+    if s < 60:
+        return f"{s:.0f} 秒"
+    if s < 3600:
+        return f"{s / 60:.1f} 分钟"
+    return f"{s / 3600:.2f} 小时"
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def hardware():
+    gpus = []
+    if shutil.which("nvidia-smi"):
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+                               capture_output=True, text=True, timeout=20)
+            gpus = [x.strip() for x in r.stdout.splitlines() if x.strip()]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024 ** 3
+        mem_s = f"{mem:.0f} GB"
+    except (ValueError, OSError, AttributeError):
+        mem_s = "?"
+    g = f"GPU {len(gpus)} 块（{gpus[0]}）" if gpus else "无 GPU"
+    return f"CPU {os.cpu_count() or '?'} 核 / 内存 {mem_s} / {g}", gpus
+
+
+# ---------- 提交前的检查：密钥、大文件 ----------
+SECRET_RES = [re.compile(p) for p in (
+    r"sk-[A-Za-z0-9_\-]{20,}", r"ghp_[A-Za-z0-9]{30,}", r"github_pat_[A-Za-z0-9_]{30,}",
+    r"AKIA[0-9A-Z]{16}", r"AIza[0-9A-Za-z_\-]{35}",
+    r"\bms-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")]
+SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|COOKIE|PASSW|AUTH|CT0|SESSION", re.I)
+
+
+def _parts(v):
+    yield v
+    for piece in re.split(r"[;\s,]+", v):
+        if "=" in piece:
+            yield piece.split("=", 1)[1]
+
+
+def secret_values():
+    vals = set()
+    for k, v in os.environ.items():
+        if SECRET_NAME.search(k) and v:
+            vals.update(_parts(v))
+    for path in (REVIEWER_ENV, os.path.join(HOME, ".agent-reach", "twitter.env")):
+        try:
+            for line in open(path, encoding="utf-8"):
+                m = re.match(r"\s*(?:export\s+)?\w+=(.*)", line.strip())
+                if m:
+                    vals.update(_parts(m.group(1).strip().strip("'\"")))
+        except OSError:
+            pass
+    cookies = load_json(os.path.join(HOME, ".agent-reach", "xhs-cookies.json"), [])
+    if isinstance(cookies, dict):
+        cookies = cookies.get("cookies", [])
+    for c in cookies if isinstance(cookies, list) else []:
+        if isinstance(c, dict) and c.get("value"):
+            vals.add(str(c["value"]))
+    return {v for v in vals if len(v) >= 12 and not v.isdigit() and "/" not in v[:1]}
+
+
+def staged_names(repo, paths):
+    out = git(repo, "diff", "--cached", "--no-renames", "--name-only", "-z", "--", *paths).stdout
+    return [n for n in out.split("\0") if n]
+
+
+def guard_staged(repo, paths):
+    """把含疑似密钥或超过 MAX_MB 的文件移出暂存区，返回警告列表。"""
+    warns, bad = [], set()
+    for n in staged_names(repo, paths):
+        p = os.path.join(repo, n)
+        if os.path.isfile(p) and os.path.getsize(p) > MAX_MB * 1024 * 1024:
+            bad.add(n)
+            warns.append(f"⚠️ 文件超过 {MAX_MB} MB，没有提交：{n}（大文件请加进 .gitignore）")
+    secrets = secret_values()
+    diff = git(repo, "diff", "--cached", "--no-renames", "-U0", "--no-color", "--", *paths).stdout
+    cur = None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            cur = line[6:] if line.startswith("+++ b/") else None
+            continue
+        if cur and cur not in bad and line.startswith("+") and (
+                any(s in line for s in secrets) or any(r.search(line) for r in SECRET_RES)):
+            bad.add(cur)
+            warns.append(f"⚠️ 发现疑似密钥，没有提交：{cur}（删掉密钥后再提交）")
+    if bad:
+        git(repo, "restore", "--staged", "--", *sorted(bad), literal=True)
+    return warns
+
+
+def push(repo):
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if not branch or branch == "HEAD":
+        return False
+    for delay in (0, 2, 4, 8, 16):
+        time.sleep(delay)
+        if git(repo, "push", "-q", "-u", "origin", branch).returncode == 0:
+            return True
+    return False
+
+
+def commit_paths(repo, paths, msg, do_push=True):
+    """在锁里提交 paths 下的改动并推送。返回 (提交号或 None, 是否推送成功, 警告)。"""
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        git(repo, "add", "-A", "--", *paths)
+        warns = guard_staged(repo, paths)
+        names = staged_names(repo, paths)
+        if not names:
+            return None, False, warns
+        # 只提交检查通过、已暂存的这些文件（不用目录 pathspec，免得把被拦下的文件从工作区带进提交）
+        r = git(repo, "commit", "-q", "-m", msg, "--pathspec-from-file=-", "--pathspec-file-nul",
+                stdin="\0".join(names), literal=True)
+        if r.returncode != 0:
+            return None, False, warns + [f"⚠️ 提交失败：{(r.stderr or r.stdout).strip()[:200]}"]
+        sha = git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
+        return sha, (push(repo) if do_push else False), warns
+
+
+# ---------- 项目模板 ----------
+CLAUDE_MD = """# 实验项目：{{TITLE}}
+
+> 由 `aris-lab new` 创建的 ARIS 实验项目。在这个文件夹里跑实验时按下面的约定做；整体流程见仓库的 `experiments/README.md`。
+
+## Pipeline Status
+
+```yaml
+stage: idle            # idle | planning | implementation | training | analysis | review | done
+idea: "{{TITLE}}"
+contract: ""
+baseline: ""
+training_status: idle  # idle | running | complete | failed
+language: zh           # ARIS 的产出用中文
+active_tasks: []
+next: "写实验计划：/experiment-plan，或照 experiments/README.md 手写 refine-logs/EXPERIMENT_PLAN.md"
+last_updated: "{{NOW}}"
+```
+
+## 要回答的问题
+
+{{QUESTION}}
+
+## 算力（Compute）
+
+- gpu: local
+- 这台机器：{{HARDWARE}}
+- 如果是 Claude Code 云端容器：没有 GPU，也不能 SSH 到别的服务器（网络只放行 HTTPS），只适合 CPU 小实验和调大模型 API 的实验；单次运行尽量控制在 2 小时内，更长的任务拆段并保存 checkpoint。
+- 需要 GPU：在有 GPU 的机器上运行 Claude Code（`claude remote-control`），把这一节改成那台机器的 GPU 信息，见 `experiments/README.md`。
+
+## 跑实验的规则
+
+1. 正式实验一律用 `aris-lab run <编号> --milestone <M0/M1/…> --desc "<一句话>" [--group <配置名>] -- <命令>` 启动，不要直接 `python xxx.py`。编号用 R001、R002…，重跑换新编号（如 R001b）。
+2. 超过几分钟的运行，用 Bash 工具的 `run_in_background: true` 启动，跑完会自动通知；期间用 `aris-lab status` 和 `tail logs/<编号>.log` 看进度。
+3. 实验脚本：超参数都走 argparse；随机种子固定且可设置；把指标写进环境变量 `ARIS_RESULT_FILE` 指向的 JSON：`{"metrics": {...}, "config": {...}}`。
+4. 评估必须用数据集自带的真实标签，不能拿别的模型的输出当标准答案（ARIS 的硬规则）。
+5. 多个 seed 或网格批量跑：同一配置用同一个 `--group`，看板自动算均值 ± 标准差；批量时可以加 `--no-commit`，整批跑完再 `aris-lab publish -m "实验：<说明>"` 一次提交。并行数不要超过 CPU 核数。
+6. 数据集、模型权重、checkpoint 不进 git（`.gitignore` 已写好）；`runs/`（运行记录）、`results/`（指标）、`logs/`（日志）和看板进 git。
+7. ARIS skill 里有 `cd "$(git rev-parse --show-toplevel …)"` 的命令块时，用子 shell `( … )` 包起来，保证当前目录一直是这个项目文件夹（ARIS 的产出都写在这里）。
+8. 每批实验跑完，在回复里写一行：「🧪 实验看板已更新：<提交号> · {{NAME}} · 共 N 次运行 · experiments/{{NAME}}/DASHBOARD.md」。
+
+## 审稿模型（Reviewer）
+
+- 本环境没有 Codex。ARIS 需要外部审稿时，按 ARIS `shared-references/reviewer-routing.md` 的「Optional HTTP API fallback」改用 `mcp__llm-chat__review`（`executor_model` 填你自己的模型 id，`files` 传要审的原始文件路径），后续轮次用 `mcp__llm-chat__review_reply`。
+- 没有 llm-chat 工具，或调用报 `LLM_API_KEY` 未设置：这一步记为 `REVIEW_UNAVAILABLE`，继续往下跑，并在结果里写明「未经外部审稿」。`aris-lab check` 可以查看审稿模型是否就绪。
+"""
+
+README_MD = """# {{TITLE}}
+
+{{QUESTION}}
+
+- 📊 看板：[DASHBOARD.md](DASHBOARD.md)（网页版 `DASHBOARD.html`，由 `aris-lab` 自动生成）
+- 🗺️ 实验计划：`refine-logs/EXPERIMENT_PLAN.md`（`/experiment-plan` 生成或手写）
+- 📝 实验日志：[EXPERIMENT_LOG.md](EXPERIMENT_LOG.md)
+- ⚙️ 本项目的约定：[CLAUDE.md](CLAUDE.md)
+"""
+
+LOG_MD = """# 实验日志（EXPERIMENT_LOG）
+
+> 本项目所有实验的永久记录，成功和失败都要写；每个实验跑完立刻追加一条（ARIS 约定）。
+> `refine-logs/EXPERIMENT_TRACKER.md` 是待办清单（TODO → RUNNING → DONE），这里是结论和复现方法，`DASHBOARD.md` 是 aris-lab 自动生成的数字汇总。
+"""
+
+GITIGNORE = """# aris-lab：数据、权重、checkpoint 不进 git
+data/
+datasets/
+checkpoints/
+ckpt/
+outputs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+logs/*.prev
+*.tmp
+"""
+
+
+EXP_README = """# 🧪 实验区（ARIS 自动跑实验）
+
+这里放用 [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep) 自动跑的实验。每个子文件夹是一个实验项目，有自己的计划、代码、运行记录和看板。
+
+## 实验项目
+
+<!-- BEGIN aris-lab projects -->
+<!-- END aris-lab projects -->
+
+## 怎么用：对 Claude 说一句话
+
+在 Claude Code 里打开这个仓库，说：
+
+> 用 ARIS 跑实验：<你的想法，或者要验证的问题>
+
+Claude 会按下面的步骤自动做完，每一步都提交到 GitHub：
+
+| 步骤 | 做什么 | 产出 |
+|---|---|---|
+| 1. 建项目 | `aris-lab new <名字>` | `experiments/<名字>/` |
+| 2. 写计划 | `/experiment-plan`：把想法拆成要证明的结论（claim）和对应的实验 | `refine-logs/EXPERIMENT_PLAN.md` |
+| 3. 写代码 | `/experiment-bridge`：按计划写实验代码 | `src/` |
+| 4. 审代码 | 审稿模型检查代码有没有 bug（没配置审稿模型就跳过） | 审稿记录 |
+| 5. 小测试 | 先跑最小的 sanity check，确认整条流程能跑通 | `runs/R001.json` |
+| 6. 正式跑 | 基线 → 主实验 → 消融，多个随机种子 | `runs/`、`results/`、`logs/` |
+| 7. 汇总 | 自动生成看板：每次运行的指标、按配置的均值 ± 标准差、柱状图 | `DASHBOARD.md`、`DASHBOARD.html` |
+| 8. 下结论 | `/analyze-results`、`/result-to-claim`：结果能支持哪些结论、还缺什么 | `EXPERIMENT_LOG.md` |
+| 9. 改进（可选） | `/auto-review-loop`：审稿 → 补实验 → 再审，循环几轮 | `review-stage/` |
+
+也可以只做其中一步，比如“把 R003 的配置再跑 5 个 seed”“看看这个项目的结果说明了什么”。
+
+## 第一次用之前：两件事
+
+### 1. 配置审稿模型（可选，建议配）
+
+ARIS 的核心是“一个模型干活，另一家的模型挑刺”：Claude 写代码、跑实验，审稿用别家的模型。
+在 claude.ai/code 的环境设置（新建对话页 → 输入框上方云朵图标 → 环境名右侧齿轮）→ **Environment variables** 里加两行：
+
+```
+LLM_PROVIDER=modelscope
+LLM_API_KEY=你的 Key
+```
+
+| 用哪家 | LLM_PROVIDER 填 | Key 在哪拿 | 费用 |
+|---|---|---|---|
+| 魔搭 ModelScope（推荐先试） | `modelscope` | modelscope.cn 登录 → 访问令牌（以 `ms-` 开头） | 免费额度，每天约 2000 次；要先绑定阿里云账号 |
+| DeepSeek 官方 | `deepseek` | platform.deepseek.com → API keys | 按量付费，很便宜，要先充值 |
+| OpenRouter | `openrouter` | openrouter.ai → Keys | 按量付费，一个 Key 用多家模型 |
+| OpenAI、Gemini、Kimi、智谱、通义、硅基流动 | `openai` / `gemini` / `moonshot` / `zhipu` / `dashscope` / `siliconflow` | 各平台控制台 | 还要加一行 `LLM_MODEL=模型名` |
+
+保存后**新开一个对话**，说“检查实验环境”。Claude 会运行 `aris-lab check`，表格里“审稿模型”一行是 ✅ 就好了。
+不配也能跑实验，只是没有外部审稿，结果里会写明“未经外部审稿”。
+
+> Key 只放在环境变量里，不要贴进聊天，也不要写进代码。aris-lab 提交前会自动拦下含疑似密钥的文件。
+
+### 2. 想好在哪跑（算力）
+
+| 在哪跑 | 适合 | 怎么做 |
+|---|---|---|
+| Claude Code 云端（网页版默认就是） | CPU 小实验；调大模型 API 做评测（Agent / 大模型方向很多实验就是这种） | 什么都不用做。4 核 CPU、16 GB 内存、没有 GPU；单次运行尽量不超过 2 小时 |
+| 你自己的 GPU 机器（实验室服务器、租的云 GPU、带显卡的电脑） | 训练、微调模型 | 在那台机器上：① 装好 Claude Code 并登录；② 运行 `curl -fsSL https://raw.githubusercontent.com/NNNoxin/claude-config/main/setup.sh \\| bash`；③ `git clone` 这个仓库，进入仓库目录运行 `claude remote-control`；④ 在 Claude 网页或手机 App 里就能看到这个会话，像现在一样聊天。再把实验项目 `CLAUDE.md` 的「算力」一节改成那台机器的 GPU 信息 |
+
+云端容器的网络只放行 HTTPS，没法从云端 SSH 到 GPU 服务器，也连不上 Modal 这类 GPU 平台；要用 GPU，就让 Claude Code 直接跑在有 GPU 的机器上。
+
+## 看结果
+
+- 每个项目的 `DASHBOARD.md`：在 GitHub 网页上直接看（每次运行的指标，按配置的均值 ± 标准差）。
+- `DASHBOARD.html`：带柱状图的网页版，下载后用浏览器打开；这里的 `index.html` 是所有项目的总览。
+- 每次运行：完整输出在 `logs/<编号>.log`，指标在 `results/<编号>.json`，命令、时间、代码版本在 `runs/<编号>.json`。
+
+## 常用命令（Claude 会自己用，你也可以在终端里用）
+
+| 命令 | 作用 |
+|---|---|
+| `aris-lab check` | 体检：ARIS、审稿模型、算力 |
+| `aris-lab new <名字> --title "标题" --question "要回答的问题"` | 新建实验项目 |
+| `aris-lab run R001 --milestone M0 --desc "说明" --group 配置名 -- python src/train.py --seed 0` | 跑一次实验：记录日志和指标、更新看板、提交推送 |
+| `aris-lab status` | 本项目所有运行的状态 |
+| `aris-lab report` | 重新生成看板 |
+| `aris-lab publish -m "说明"` | 提交并推送实验区的改动 |
+
+## 实验脚本的约定
+
+- 超参数都用命令行参数（argparse），随机种子可以设置。
+- 结果写进环境变量 `ARIS_RESULT_FILE` 指向的 JSON：`{"metrics": {"acc": 0.93}, "config": {"lr": 0.001}}`。
+- 评估用数据集自带的真实标签，不能拿别的模型的输出当标准答案。
+- 数据集、模型权重、checkpoint 不进 git；结果、日志、看板进 git。
+"""
+
+
+def fill(tpl, **kw):
+    for k, v in kw.items():
+        tpl = tpl.replace("{{" + k + "}}", v)
+    return tpl
+
+
+def cmd_new(a):
+    name = a.name.strip().strip("/")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        sys.exit("项目名只能用英文字母、数字、点、横线、下划线，例如 demo-calibration")
+    root = git_root() or os.getcwd()
+    proj = os.path.join(root, "experiments", name)
+    if os.path.exists(os.path.join(proj, MARK)):
+        sys.exit(f"这个项目已经存在：{proj}")
+    for sub in ("refine-logs", "src", "runs", "results", "logs"):
+        os.makedirs(os.path.join(proj, sub), exist_ok=True)
+    for sub in ("runs", "results", "logs"):
+        open(os.path.join(proj, sub, ".gitkeep"), "a").close()
+    hw, _ = hardware()
+    title = a.title or name
+    question = a.question or "（还没写：这个项目要回答什么问题？）"
+    meta = {"name": name, "title": title, "question": question, "created": now("%Y-%m-%d %H:%M")}
+    save_json(os.path.join(proj, MARK), meta)
+    kw = dict(TITLE=title, NAME=name, QUESTION=question, HARDWARE=hw, NOW=now("%Y-%m-%d %H:%M"))
+    for fn, tpl in (("CLAUDE.md", CLAUDE_MD), ("README.md", README_MD), ("EXPERIMENT_LOG.md", LOG_MD),
+                    (".gitignore", GITIGNORE)):
+        path = os.path.join(proj, fn)
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(fill(tpl, **kw))
+    build_reports(proj)
+    rel = os.path.relpath(proj, root)
+    print(f"已创建实验项目：{rel}/")
+    print(f"  算力：{hw}")
+    print("下一步：")
+    print(f"  1. cd {rel}")
+    print("  2. 写实验计划：/experiment-plan \"你的想法\"（或手写 refine-logs/EXPERIMENT_PLAN.md）")
+    print("  3. 跑计划：/experiment-bridge；单次运行用 aris-lab run R001 --milestone M0 -- python src/xxx.py")
+
+
+# ---------- 跑实验 ----------
+def kill_group(p):
+    for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:
+            return
+        try:
+            p.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def cmd_run(a):
+    proj = need_project(a)
+    meta = load_json(os.path.join(proj, MARK), {})
+    cmd = list(a.cmd)
+    if not cmd:
+        sys.exit("缺少要运行的命令，例如：aris-lab run R001 --milestone M0 -- python src/train.py --seed 0")
+    rid = a.run_id
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", rid):
+        sys.exit("编号只能用英文字母、数字和 . _ -，例如 R001")
+    rec_path = os.path.join(proj, "runs", f"{rid}.json")
+    old = load_json(rec_path)
+    if old:
+        if old.get("status") == "running" and old.get("host") == socket.gethostname() and pid_alive(old.get("pid")):
+            sys.exit(f"{rid} 正在运行（pid {old['pid']}），换一个编号或等它结束")
+        if old.get("status") == "done" and not a.force:
+            sys.exit(f"{rid} 已经跑完了；重跑请换编号（如 {rid}b），确实要覆盖就加 --force")
+    log_rel, res_rel = f"logs/{rid}.log", f"results/{rid}.json"
+    log_path, res_path = os.path.join(proj, log_rel), os.path.join(proj, res_rel)
+    if os.path.exists(log_path):
+        os.replace(log_path, log_path + ".prev")
+    if os.path.exists(res_path):
+        os.remove(res_path)
+
+    repo = git_root(proj)
+    name = meta.get("name") or os.path.basename(proj)
+    if repo and not a.no_commit:  # 运行前先给代码拍快照，保证记录里的提交号就是跑出这个结果的代码
+        rel = os.path.relpath(proj, repo)
+        excl = [f":(exclude){rel}/{d}" for d in ("runs", "results", "logs")]
+        sha, ok, warns = commit_paths(repo, [rel, *excl], f"实验代码快照：{name} {rid} 运行前")
+        for w in warns:
+            print(w, file=sys.stderr)
+    head = git(repo, "rev-parse", "--short", "HEAD").stdout.strip() if repo else ""
+    dirty = bool(git(repo, "status", "--porcelain", "--", proj).stdout.strip()) if repo else False
+    hw, _ = hardware()
+    rec = {"run_id": rid, "milestone": a.milestone or "", "desc": a.desc or "", "group": a.group or "",
+           "command": shlex.join(cmd), "workdir": os.path.relpath(os.getcwd(), proj),
+           "status": "running", "exit_code": None, "started": now(), "finished": None, "duration_s": None,
+           "host": socket.gethostname(), "hardware": hw, "git_commit": head, "code_dirty": dirty,
+           "log": log_rel, "result_file": res_rel, "metrics": {}, "config": {}, "note": ""}
+    env = dict(os.environ, ARIS_RUN_ID=rid, ARIS_RESULT_FILE=res_path, ARIS_PROJECT_DIR=proj, PYTHONUNBUFFERED="1")
+    state = {"status": None}
+    t0 = time.time()
+    code, last = None, None
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+        log.write(f"# aris-lab run {rid} · {rec['started']} · {rec['command']}\n")
+        log.flush()
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+                                 start_new_session=True, text=True, errors="replace", bufsize=1)
+        except OSError as e:
+            log.write(f"无法启动命令：{e}\n")
+            p = None
+            code, state["status"] = 127, "failed"
+            rec["note"] = f"无法启动命令：{e}"
+        if p:
+            rec["pid"] = p.pid
+            save_json(rec_path, rec)
+            build_reports(proj)
+
+            def stop(signum, frame):
+                state["status"] = "killed"
+                threading.Thread(target=kill_group, args=(p,), daemon=True).start()
+            signal.signal(signal.SIGTERM, stop)
+            signal.signal(signal.SIGINT, stop)
+            timer = None
+            if a.timeout:
+                def on_timeout():
+                    state["status"] = "timeout"
+                    kill_group(p)
+                timer = threading.Timer(a.timeout, on_timeout)
+                timer.daemon = True
+                timer.start()
+            for line in p.stdout:
+                log.write(line)
+                log.flush()
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if line.startswith("ARIS_RESULT "):
+                    last = line[len("ARIS_RESULT "):].strip()
+            code = p.wait()
+            if timer:
+                timer.cancel()
+        log.write(f"# 结束 · {now()} · 退出码 {code}\n")
+
+    status = state["status"] or ("done" if code == 0 else "failed")
+    result = load_json(res_path)
+    if result is None and last:
+        try:
+            result = json.loads(last)
+            save_json(res_path, result)
+        except ValueError:
+            rec["note"] = "ARIS_RESULT 行不是合法 JSON"
+    if isinstance(result, dict):
+        metrics = result.get("metrics")
+        if not isinstance(metrics, dict):
+            metrics = {k: v for k, v in result.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        rec["metrics"] = metrics
+        rec["config"] = result.get("config") if isinstance(result.get("config"), dict) else {}
+        if not rec["group"] and result.get("group"):
+            rec["group"] = str(result["group"])
+    if status == "done" and not rec["metrics"]:
+        rec["note"] = rec["note"] or "脚本没有写出指标（ARIS_RESULT_FILE 或 ARIS_RESULT 行）"
+    rec.update(status=status, exit_code=code, finished=now(), duration_s=round(time.time() - t0, 1))
+    rec.pop("pid", None)
+    save_json(rec_path, rec)
+    build_reports(proj)
+
+    key = ", ".join(f"{k}={fmt_num(v)}" for k, v in list(rec["metrics"].items())[:4])
+    print(f"\n[aris-lab] {rid} {STATUS[status]} · 用时 {fmt_dur(rec['duration_s'])}" + (f" · {key}" if key else ""))
+    if repo and not a.no_commit:
+        rel = os.path.relpath(proj, repo)
+        msg = f"实验 {name}/{rid}：{STATUS[status].split()[-1]}" + (f"（{key}）" if key else "")
+        sha, ok, warns = commit_paths(repo, [rel, os.path.relpath(os.path.join(repo, "experiments"), repo)], msg)
+        for w in warns:
+            print(w)
+        if sha:
+            print(f"[aris-lab] {'已推送' if ok else '已提交（推送失败，稍后 aris-lab publish 重试）'} {sha}：{msg}")
+    if status == "timeout":
+        sys.exit(124)
+    if status == "killed":
+        sys.exit(130)
+    sys.exit(0 if status == "done" else (code if isinstance(code, int) and code > 0 else 1))
+
+
+# ---------- 看板 ----------
+def load_runs(proj):
+    runs = []
+    host = socket.gethostname()
+    for path in glob.glob(os.path.join(proj, "runs", "*.json")):
+        r = load_json(path)
+        if not isinstance(r, dict) or "run_id" not in r:
+            continue
+        if r.get("status") == "running" and r.get("host") == host and not pid_alive(r.get("pid")):
+            r["status"] = "lost"
+            r["note"] = r.get("note") or "进程已不在（容器重启或被杀掉），没有正常结束"
+            save_json(path, r)
+        runs.append(r)
+    runs.sort(key=lambda r: natkey(r["run_id"]))
+    return runs
+
+
+def metric_keys(runs):
+    keys = []
+    for r in runs:
+        for k, v in (r.get("metrics") or {}).items():
+            if k not in keys and isinstance(v, (int, float)) and not isinstance(v, bool):
+                keys.append(k)
+    return keys
+
+
+def aggregate(runs, keys):
+    groups = {}
+    for r in runs:
+        if r.get("status") == "done" and r.get("group"):
+            groups.setdefault(r["group"], []).append(r)
+    out = []
+    for g, rs in groups.items():
+        row = {"group": g, "n": len(rs), "stats": {}}
+        for k in keys:
+            vals = [r["metrics"][k] for r in rs if isinstance((r.get("metrics") or {}).get(k), (int, float))]
+            if vals:
+                row["stats"][k] = (statistics.fmean(vals), statistics.stdev(vals) if len(vals) > 1 else 0.0, len(vals))
+        out.append(row)
+    out.sort(key=lambda x: natkey(x["group"]))
+    return out
+
+
+def counts(runs):
+    c = {}
+    for r in runs:
+        c[r.get("status")] = c.get(r.get("status"), 0) + 1
+    return c
+
+
+def project_files(proj):
+    cand = [("实验计划", "refine-logs/EXPERIMENT_PLAN.md"), ("实验追踪", "refine-logs/EXPERIMENT_TRACKER.md"),
+            ("初步结果", "refine-logs/EXPERIMENT_RESULTS.md"), ("实验日志", "EXPERIMENT_LOG.md"),
+            ("结果分析", "ANALYSIS.md"), ("审稿记录", "review-stage/AUTO_REVIEW.md"), ("项目约定", "CLAUDE.md")]
+    return [(t, p) for t, p in cand if os.path.exists(os.path.join(proj, p))]
+
+
+def latest_time(meta, runs):
+    ts = [meta.get("created", "")] + [r.get("finished") or r.get("started") or "" for r in runs]
+    return max(t for t in ts if t is not None) or ""
+
+
+def run_metrics_cells(r, keys):
+    m = r.get("metrics") or {}
+    return [fmt_num(m[k]) if k in m else "" for k in keys]
+
+
+def md_escape(s):
+    return str(s).replace("|", "\\|").replace("\n", " ")
+
+
+def render_md(proj, meta, runs):
+    keys = metric_keys(runs)
+    agg = aggregate(runs, keys)
+    c = counts(runs)
+    L = [f"# 🧪 实验看板：{meta.get('title', meta.get('name'))}", "",
+         f"> 要回答的问题：{meta.get('question', '')}", "",
+         f"- 运行：共 {len(runs)} 次 · ✅ 完成 {c.get('done', 0)} · ❌ 失败 {c.get('failed', 0) + c.get('timeout', 0) + c.get('killed', 0) + c.get('lost', 0)} · ⏳ 运行中 {c.get('running', 0)}",
+         f"- 数据更新：{latest_time(meta, runs)}"]
+    files = project_files(proj)
+    if files:
+        L.append("- 文件：" + " · ".join(f"[{t}]({p})" for t, p in files))
+    L += ["", "_由 `aris-lab` 自动生成，手改会被覆盖。_", ""]
+    if agg and keys:
+        L += ["## 按配置汇总（均值 ± 标准差）", "", "| 配置 | 完成次数 | " + " | ".join(keys) + " |",
+              "|---|---:|" + "---:|" * len(keys)]
+        for row in agg:
+            cells = []
+            for k in keys:
+                if k in row["stats"]:
+                    m, s, n = row["stats"][k]
+                    cells.append(f"{fmt_num(m)} ± {fmt_num(s)}" if n > 1 else fmt_num(m))
+                else:
+                    cells.append("")
+            L.append(f"| {md_escape(row['group'])} | {row['n']} | " + " | ".join(cells) + " |")
+        L.append("")
+    L += ["## 全部运行", ""]
+    if not runs:
+        L += ["还没有运行。用 `aris-lab run R001 --milestone M0 --desc \"健全性检查\" -- python src/xxx.py` 开始。", ""]
+    by_ms = {}
+    for r in runs:
+        by_ms.setdefault(r.get("milestone") or "未分组", []).append(r)
+    for ms in sorted(by_ms, key=natkey):
+        L += [f"### {ms}", "", "| 编号 | 说明 | 状态 | 配置 | " + " | ".join(keys) + (" | " if keys else "") + "用时 | 日志 | 代码版本 |",
+              "|---|---|---|---|" + "---:|" * len(keys) + "---|---|---|"]
+        for r in by_ms[ms]:
+            note = f"（{r['note']}）" if r.get("note") else ""
+            L.append("| " + " | ".join([r["run_id"], md_escape(r.get("desc", "") + note), STATUS.get(r.get("status"), r.get("status", "")),
+                                        md_escape(r.get("group", "")), *run_metrics_cells(r, keys), fmt_dur(r.get("duration_s")),
+                                        f"[log]({r.get('log')})", r.get("git_commit", "") + ("*" if r.get("code_dirty") else "")]) + " |")
+        L.append("")
+    if any(r.get("code_dirty") for r in runs):
+        L += ["代码版本带 * 的运行：运行时还有没提交的代码改动。", ""]
+    return "\n".join(L)
+
+
+CSS = """:root{--bg:#f7f6f3;--fg:#1d1d1b;--muted:#6b6a66;--card:#fff;--line:#e3e1db;--accent:#c96442;--chip:#efede8;--bar:#d9a48f;--ok:#2f7d4f;--bad:#b3261e}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1a1a19;--fg:#ecebe7;--muted:#a19f99;--card:#242423;--line:#3a3936;--accent:#e08a6a;--chip:#2f2e2c;--bar:#9a5a43;--ok:#7cc79a;--bad:#f2b8b5}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+a{color:var(--accent)}
+.wrap{max-width:1100px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:24px;margin:0 0 6px}
+h2{font-size:16px;color:var(--accent);border-bottom:1px solid var(--line);padding-bottom:6px;margin-top:32px}
+h3{font-size:15px;margin:20px 0 6px}
+.meta{color:var(--muted);font-size:13px}
+.stats{display:flex;gap:12px;flex-wrap:wrap;margin:18px 0}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 16px;min-width:110px}
+.stat b{display:block;font-size:22px}
+.stat span{color:var(--muted);font-size:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:12px 0}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top;white-space:nowrap}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+td.desc{white-space:normal;min-width:12em}
+.s-done{color:var(--ok)}.s-failed,.s-timeout,.s-killed,.s-lost{color:var(--bad)}
+.chip{display:inline-block;background:var(--chip);border-radius:999px;padding:1px 10px;font-size:12px;margin:2px 4px 2px 0;color:var(--muted)}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+svg text{fill:var(--fg);font-size:11px}
+svg .bar{fill:var(--bar)}svg .err{stroke:var(--fg);stroke-width:1}
+"""
+
+
+def esc(s):
+    return html.escape(str(s if s is not None else ""))
+
+
+def chart_svg(agg, key):
+    rows = [(r["group"], *r["stats"][key][:2]) for r in agg if key in r["stats"]]
+    if len(rows) < 2 or any(m < 0 for _, m, _ in rows):
+        return ""
+    top = max(m + s for _, m, s in rows) or 1.0
+    w, lab, bh, gap = 320, 110, 16, 6
+    h = len(rows) * (bh + gap) + 24
+    out = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" aria-label="{esc(key)}">',
+           f'<text x="0" y="12" style="font-weight:600">{esc(key)}（均值 ± 标准差）</text>']
+    span = w - lab - 50
+    for i, (g, m, s) in enumerate(rows):
+        y = 22 + i * (bh + gap)
+        x1 = lab + span * m / top
+        out.append(f'<text x="{lab - 6}" y="{y + bh - 4}" text-anchor="end">{esc(g[:16])}</text>')
+        out.append(f'<rect class="bar" x="{lab}" y="{y}" width="{max(span * m / top, 1):.1f}" height="{bh}" rx="2"/>')
+        if s > 0:
+            a, b = lab + span * max(m - s, 0) / top, lab + span * (m + s) / top
+            out.append(f'<line class="err" x1="{a:.1f}" x2="{b:.1f}" y1="{y + bh / 2}" y2="{y + bh / 2}"/>')
+        out.append(f'<text x="{x1 + 6 + (span * s / top if s > 0 else 0):.1f}" y="{y + bh - 4}">{esc(fmt_num(m))}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def render_html(proj, meta, runs):
+    keys = metric_keys(runs)
+    agg = aggregate(runs, keys)
+    c = counts(runs)
+    title = meta.get("title", meta.get("name"))
+    bad = c.get("failed", 0) + c.get("timeout", 0) + c.get("killed", 0) + c.get("lost", 0)
+    P = [f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
+         f"<title>实验看板 · {esc(title)}</title><style>{CSS}</style></head><body><div class='wrap'>",
+         f"<h1>🧪 {esc(title)}</h1><div class='meta'>要回答的问题：{esc(meta.get('question', ''))}</div>",
+         f"<div class='meta'>数据更新：{esc(latest_time(meta, runs))} · 由 aris-lab 自动生成</div>",
+         "<div class='stats'>" + "".join(f"<div class='stat'><b>{n}</b><span>{t}</span></div>" for n, t in (
+             (len(runs), "运行总数"), (c.get("done", 0), "✅ 完成"), (bad, "❌ 失败/中断"), (c.get("running", 0), "⏳ 运行中"))) + "</div>"]
+    files = project_files(proj)
+    if files:
+        P.append("<div>" + "".join(f"<a class='chip' href='{esc(p)}'>{esc(t)}</a>" for t, p in files) + "</div>")
+    if agg and keys:
+        P.append("<h2>按配置汇总（均值 ± 标准差）</h2><div class='card tbl'><table><tr><th>配置</th><th class='num'>完成次数</th>"
+                 + "".join(f"<th class='num'>{esc(k)}</th>" for k in keys) + "</tr>")
+        for row in agg:
+            cells = []
+            for k in keys:
+                if k in row["stats"]:
+                    m, s, n = row["stats"][k]
+                    cells.append(f"<td class='num'>{esc(fmt_num(m))}" + (f" ± {esc(fmt_num(s))}" if n > 1 else "") + "</td>")
+                else:
+                    cells.append("<td></td>")
+            P.append(f"<tr><td>{esc(row['group'])}</td><td class='num'>{row['n']}</td>{''.join(cells)}</tr>")
+        P.append("</table></div>")
+        charts = [chart_svg(agg, k) for k in keys[:8]]
+        charts = [x for x in charts if x]
+        if charts:
+            P.append("<div class='charts'>" + "".join(f"<div class='card'>{x}</div>" for x in charts) + "</div>")
+    P.append("<h2>全部运行</h2>")
+    if not runs:
+        P.append("<p class='meta'>还没有运行。</p>")
+    by_ms = {}
+    for r in runs:
+        by_ms.setdefault(r.get("milestone") or "未分组", []).append(r)
+    for ms in sorted(by_ms, key=natkey):
+        P.append(f"<h3>{esc(ms)}</h3><div class='card tbl'><table><tr><th>编号</th><th>说明</th><th>状态</th><th>配置</th>"
+                 + "".join(f"<th class='num'>{esc(k)}</th>" for k in keys) + "<th>用时</th><th>日志</th><th>代码版本</th></tr>")
+        for r in by_ms[ms]:
+            st = r.get("status", "")
+            note = f"<br><span class='meta'>{esc(r['note'])}</span>" if r.get("note") else ""
+            cmd = f"<br><span class='meta'><code>{esc(r.get('command', ''))}</code></span>"
+            P.append(f"<tr><td>{esc(r['run_id'])}</td><td class='desc'>{esc(r.get('desc', ''))}{note}{cmd}</td>"
+                     f"<td class='s-{esc(st)}'>{esc(STATUS.get(st, st))}</td><td>{esc(r.get('group', ''))}</td>"
+                     + "".join(f"<td class='num'>{esc(v)}</td>" for v in run_metrics_cells(r, keys))
+                     + f"<td>{esc(fmt_dur(r.get('duration_s')))}</td><td><a href='{esc(r.get('log'))}'>log</a></td>"
+                     f"<td>{esc(r.get('git_commit', ''))}{'*' if r.get('code_dirty') else ''}</td></tr>")
+        P.append("</table></div>")
+    P.append("</div></body></html>\n")
+    return "".join(P)
+
+
+def all_projects(repo_or_dir):
+    base = os.path.join(repo_or_dir, "experiments")
+    return sorted((os.path.dirname(p) for p in glob.glob(os.path.join(base, "*", MARK))), key=natkey)
+
+
+def build_index(exp_dir):
+    projs = sorted((os.path.dirname(p) for p in glob.glob(os.path.join(exp_dir, "*", MARK))), key=natkey)
+    rows = []
+    for proj in projs:
+        meta = load_json(os.path.join(proj, MARK), {})
+        runs = load_runs(proj)
+        c = counts(runs)
+        rows.append((os.path.basename(proj), meta, len(runs), c, latest_time(meta, runs)))
+    md = ["| 项目 | 要回答的问题 | 运行 | 完成 | 最近更新 | 看板 |", "|---|---|---:|---:|---|---|"]
+    for name, meta, n, c, t in rows:
+        md.append(f"| {md_escape(meta.get('title', name))} | {md_escape(meta.get('question', ''))} | {n} | {c.get('done', 0)} | {t} | [{name}/DASHBOARD.md]({name}/DASHBOARD.md) |")
+    if not rows:
+        md.append("| （还没有项目，用 `aris-lab new <名字>` 新建） | | | | | |")
+    block = "<!-- BEGIN aris-lab projects -->\n" + "\n".join(md) + "\n<!-- END aris-lab projects -->"
+    readme = os.path.join(exp_dir, "README.md")
+    old = open(readme, encoding="utf-8").read() if os.path.exists(readme) else EXP_README
+    pat = re.compile(r"<!-- BEGIN aris-lab projects -->.*?<!-- END aris-lab projects -->", re.S)
+    new = pat.sub(lambda _: block, old) if pat.search(old) else old.rstrip() + "\n\n" + block + "\n"
+    write_if_changed(readme, new)
+    H = ["<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
+         f"<title>实验总览</title><style>{CSS}</style></head><body><div class='wrap'><h1>🧪 实验总览</h1>",
+         "<div class='meta'>每个实验项目一张看板，由 aris-lab 自动生成</div><div class='card tbl'><table>",
+         "<tr><th>项目</th><th>要回答的问题</th><th class='num'>运行</th><th class='num'>完成</th><th>最近更新</th></tr>"]
+    for name, meta, n, c, t in rows:
+        H.append(f"<tr><td><a href='{esc(name)}/DASHBOARD.html'>{esc(meta.get('title', name))}</a></td>"
+                 f"<td class='desc'>{esc(meta.get('question', ''))}</td><td class='num'>{n}</td><td class='num'>{c.get('done', 0)}</td><td>{esc(t)}</td></tr>")
+    H.append("</table></div></div></body></html>\n")
+    write_if_changed(os.path.join(exp_dir, "index.html"), "".join(H))
+
+
+def build_reports(proj):
+    meta = load_json(os.path.join(proj, MARK), {})
+    runs = load_runs(proj)
+    write_if_changed(os.path.join(proj, "DASHBOARD.md"), render_md(proj, meta, runs) + "\n")
+    write_if_changed(os.path.join(proj, "DASHBOARD.html"), render_html(proj, meta, runs))
+    exp_dir = os.path.dirname(proj)
+    if os.path.basename(exp_dir) == "experiments":
+        build_index(exp_dir)
+
+
+def cmd_report(a):
+    proj = find_project(a.project)
+    if proj and not a.all:
+        build_reports(proj)
+        print(os.path.join(proj, "DASHBOARD.md"))
+        return
+    root = git_root() or os.getcwd()
+    projs = all_projects(root)
+    for p in projs:
+        build_reports(p)
+        print(os.path.join(p, "DASHBOARD.md"))
+    if not projs:
+        print("没有找到实验项目（experiments/*/.aris-lab.json）")
+
+
+def cmd_status(a):
+    proj = need_project(a)
+    runs = load_runs(proj)
+    keys = metric_keys(runs)[:4]
+    if not runs:
+        print("还没有运行。")
+        return
+    print(f"{'编号':<10}{'阶段':<8}{'状态':<10}{'开始时间':<21}{'用时':<12}指标")
+    for r in runs:
+        m = r.get("metrics") or {}
+        ms = ", ".join(f"{k}={fmt_num(m[k])}" for k in keys if k in m)
+        dur = fmt_dur(r.get("duration_s")) if r.get("duration_s") is not None else "…"
+        print(f"{r['run_id']:<10}{(r.get('milestone') or '-'):<8}{STATUS.get(r.get('status'), r.get('status')):<10}"
+              f"{r.get('started', ''):<21}{dur:<12}{ms}")
+    build_reports(proj)
+
+
+def cmd_publish(a):
+    repo = git_root()
+    if not repo:
+        if a.auto:
+            return
+        sys.exit("不在 git 仓库里")
+    exp = os.path.join(repo, "experiments")
+    if not os.path.isdir(exp):
+        if a.auto:
+            return
+        sys.exit("这个仓库还没有 experiments/ 文件夹")
+    if a.auto and not git(repo, "status", "--porcelain", "--", "experiments").stdout.strip():
+        return
+    for p in all_projects(repo):
+        build_reports(p)
+    sha, ok, warns = commit_paths(repo, ["experiments"], a.message or "实验：更新实验记录和看板")
+    for w in warns:
+        print(w)
+    if sha:
+        print(f"{'已推送' if ok else '已提交（推送失败）'} {sha}：{a.message or '实验：更新实验记录和看板'}")
+    elif not a.auto:
+        print("experiments/ 没有需要提交的改动")
+
+
+# ---------- 审稿模型 ----------
+def read_env_file(path):
+    out = {}
+    try:
+        for line in open(path, encoding="utf-8"):
+            m = re.match(r"\s*(?:export\s+)?(\w+)=(.*)", line.rstrip("\n"))
+            if m:
+                v = m.group(2).strip()
+                try:
+                    v = shlex.split(v)[0] if v else ""
+                except ValueError:
+                    pass
+                out[m.group(1)] = v
+    except OSError:
+        pass
+    return out
+
+
+def reviewer_conf():
+    """环境变量优先，其次 ~/.aris/reviewer.env；LLM_PROVIDER 或 Key 前缀补全地址和默认模型。"""
+    f = read_env_file(REVIEWER_ENV)
+    get = lambda k: (os.environ.get(k) or f.get(k) or "").strip()
+    key, base, model, prov = get("LLM_API_KEY"), get("LLM_BASE_URL"), get("LLM_MODEL"), get("LLM_PROVIDER").lower()
+    if not prov and not base:
+        prov = "modelscope" if key.startswith("ms-") else "openrouter" if key.startswith("sk-or-") else \
+            "gemini" if key.startswith("AIza") else ""
+    if prov in PROVIDERS:
+        base = base or PROVIDERS[prov][0]
+        model = model or PROVIDERS[prov][1]
+    return {"provider": prov, "key": key, "base": base, "model": model,
+            "fallback": get("LLM_FALLBACK_MODEL") or model}
+
+
+def reviewer_test(conf, timeout=90):
+    url = conf["base"].rstrip("/") + "/chat/completions"
+    body = json.dumps({"model": conf["model"], "max_tokens": 64,
+                       "messages": [{"role": "user", "content": "Reply with exactly: OK"}]}).encode()
+    req = urlrequest.Request(url, data=body, headers={"Content-Type": "application/json",
+                                                       "Authorization": f"Bearer {conf['key']}"})
+    t0 = time.time()
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        msg = (d.get("choices") or [{}])[0].get("message") or {}
+        text = (msg.get("content") or msg.get("reasoning_content") or "").strip().replace("\n", " ")
+        return True, f"{d.get('model') or conf['model']} 可用（{time.time() - t0:.1f} 秒，回复：{text[:30] or '空'}）"
+    except urlerror.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:160].replace("\n", " ")
+        hint = {401: "Key 不对或已失效", 403: "没有权限（可能要实名或开通）", 404: "地址或模型名不对",
+                429: "请求太频繁或额度用完", 400: "请求被拒绝（多半是模型名不对）"}.get(e.code, "")
+        return False, f"HTTP {e.code} {hint}：{detail}"
+    except Exception as e:
+        return False, f"连不上：{type(e).__name__} {str(e)[:120]}"
+
+
+def cmd_reviewer(a):
+    if a.exec_server:  # 给 MCP 用：补全配置后启动 ARIS 的 llm-chat 服务（标准输出只能留给 MCP 协议）
+        conf = reviewer_conf()
+        env = dict(os.environ, LLM_REVIEW_FALLBACK_ENABLED=os.environ.get("LLM_REVIEW_FALLBACK_ENABLED", "true"))
+        for k, v in (("LLM_API_KEY", conf["key"]), ("LLM_BASE_URL", conf["base"]), ("LLM_MODEL", conf["model"]),
+                     ("LLM_FALLBACK_MODEL", conf["fallback"])):
+            if v:
+                env[k] = v
+        repo = (open(os.path.join(HOME, ".aris", "repo")).read().strip()
+                if os.path.exists(os.path.join(HOME, ".aris", "repo")) else os.path.join(HOME, "aris_repo"))
+        py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
+        server = os.path.join(repo, "mcp-servers", "llm-chat", "server.py")
+        os.execve(py, [py, server], env)
+    conf = reviewer_conf()
+    if not conf["key"]:
+        print("审稿模型：未配置（没有 LLM_API_KEY）")
+        print("配置方法：在云端环境的环境变量里加两行，然后开新对话：")
+        print("  LLM_PROVIDER=modelscope   （或 deepseek / openrouter / gemini / openai / siliconflow / dashscope / moonshot / zhipu）")
+        print("  LLM_API_KEY=你的 Key")
+        print("  （其他提供商再加 LLM_MODEL=模型名；自定义地址用 LLM_BASE_URL）")
+        return 1
+    print(f"审稿模型：{conf['provider'] or '自定义'} · {conf['model'] or '（缺 LLM_MODEL）'} · {conf['base'] or '（缺 LLM_BASE_URL）'}")
+    if not conf["base"] or not conf["model"]:
+        print("缺少地址或模型名：请补上 LLM_BASE_URL 或 LLM_MODEL")
+        return 1
+    if a.test:
+        ok, msg = reviewer_test(conf)
+        print(("✅ " if ok else "❌ ") + msg)
+        return 0 if ok else 1
+    return 0
+
+
+def mcp_registered(name):
+    cfg = load_json(os.path.join(HOME, ".claude.json"), {}) or {}
+    return name in (cfg.get("mcpServers") or {})
+
+
+# ---------- 体检 ----------
+def cmd_check(a):
+    rows = []
+    here = git_root()
+    doc = ("experiments/README.md" if here and os.path.exists(os.path.join(here, "experiments", "README.md"))
+           else "github.com/NNNoxin/claude-config 的「自动跑实验」")
+    repo = os.path.join(HOME, "aris_repo")
+    if os.path.exists(os.path.join(HOME, ".aris", "repo")):
+        repo = open(os.path.join(HOME, ".aris", "repo")).read().strip() or repo
+    if os.path.isdir(os.path.join(repo, "skills")):
+        r = git(repo, "log", "-1", "--format=%h · %cd", "--date=short")
+        rows.append(("ARIS 仓库", "✅", f"{r.stdout.strip() or '?'} · {repo}"))
+    else:
+        rows.append(("ARIS 仓库", "❌", "没装：运行 claude-config 的 setup.sh"))
+    sk = os.path.join(HOME, ".claude", "skills")
+    linked = [n for n in (os.listdir(sk) if os.path.isdir(sk) else [])
+              if os.path.islink(os.path.join(sk, n)) and os.path.realpath(os.path.join(sk, n)).startswith(os.path.realpath(repo))
+              and os.path.isfile(os.path.join(sk, n, "SKILL.md"))]
+    rows.append(("ARIS skills", "✅" if linked else "❌",
+                 f"{len(linked)} 个（/experiment-plan、/experiment-bridge、/run-experiment、/auto-review-loop 等）" if linked else "没装好：重跑 setup.sh"))
+    conf = reviewer_conf()
+    if not conf["key"]:
+        rows.append(("审稿模型", "❌ 未配置", f"在环境变量里加 LLM_PROVIDER 和 LLM_API_KEY（见 {doc}）；不配也能跑，只是没有外部审稿"))
+    elif not conf["base"] or not conf["model"]:
+        rows.append(("审稿模型", "❌", "缺 LLM_BASE_URL 或 LLM_MODEL"))
+    else:
+        ok, msg = reviewer_test(conf)
+        rows.append(("审稿模型", "✅" if ok else "❌", msg))
+    rows.append(("审稿工具注册", "✅" if mcp_registered("llm-chat") else "❌",
+                 "llm-chat（ARIS 需要审稿时调用；新对话生效）" if mcp_registered("llm-chat") else "没注册：重跑 setup.sh"))
+    rows.append(("Codex 审稿", "✅" if shutil.which("codex") else "🚫", "已安装" if shutil.which("codex") else "没装（可选，需要 ChatGPT 账号；没有就用上面的审稿模型）"))
+    hw, gpus = hardware()
+    rows.append(("算力", "✅" if gpus else "ℹ️", hw + ("" if gpus else f"：适合 CPU 小实验和调 API 的实验；要 GPU 见 {doc}")))
+    try:
+        free = shutil.disk_usage(HOME).free / 1024 ** 3
+        rows.append(("磁盘", "✅" if free > 5 else "⚠️", f"剩余 {free:.0f} GB"))
+    except OSError:
+        pass
+    probe = ("import importlib.util as u\n"
+             "print(' '.join(n+('✓' if u.find_spec(m) else '✗') for n,m in "
+             "[('numpy','numpy'),('scipy','scipy'),('scikit-learn','sklearn'),('torch','torch'),('transformers','transformers')]))")
+    r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    rows.append(("Python 包（系统）", "ℹ️", (r.stdout.strip() or "?") + "（每个实验项目建议用自己的 .venv）"))
+    repo_here = here
+    if repo_here:
+        n = len(all_projects(repo_here))
+        rows.append(("实验项目", "ℹ️", f"{os.path.basename(repo_here)}/experiments/ 下有 {n} 个" if n else "当前仓库还没有，用 aris-lab new <名字> 新建"))
+    out = [f"## ARIS 实验环境体检（{now('%Y-%m-%d %H:%M')}）", "", "| 项目 | 状态 | 说明 |", "|---|---|---|"]
+    out += [f"| {a_} | {b} | {md_escape(c_)} |" for a_, b, c_ in rows]
+    text = "\n".join(out)
+    print(text)
+    os.makedirs(os.path.join(HOME, ".aris"), exist_ok=True)
+    write_if_changed(os.path.join(HOME, ".aris", "health-report.md"), text + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="aris-lab", description="配合 ARIS 自动跑实验", formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__)
+    sub = ap.add_subparsers(dest="cmd_name", required=True)
+    p = sub.add_parser("new", help="新建实验项目")
+    p.add_argument("name")
+    p.add_argument("--title")
+    p.add_argument("--question")
+    p.set_defaults(fn=cmd_new)
+    p = sub.add_parser("run", help="跑一次实验并记录")
+    p.add_argument("run_id")
+    p.add_argument("--milestone", default="")
+    p.add_argument("--desc", default="")
+    p.add_argument("--group", default="")
+    p.add_argument("--timeout", type=float, default=0, help="超过这么多秒就停掉")
+    p.add_argument("--no-commit", action="store_true", help="不提交（批量跑时用，最后 aris-lab publish）")
+    p.add_argument("--force", action="store_true", help="覆盖已经完成的同名运行")
+    p.add_argument("--project", help="实验项目文件夹（默认从当前目录往上找）")
+    p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("status", help="列出本项目的运行")
+    p.add_argument("--project")
+    p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("report", help="重新生成看板")
+    p.add_argument("--project")
+    p.add_argument("--all", action="store_true")
+    p.set_defaults(fn=cmd_report)
+    p = sub.add_parser("publish", help="提交并推送 experiments/")
+    p.add_argument("-m", "--message")
+    p.add_argument("--auto", action="store_true")
+    p.set_defaults(fn=cmd_publish)
+    p = sub.add_parser("reviewer", help="查看 / 测试审稿模型配置")
+    p.add_argument("--test", action="store_true")
+    p.add_argument("--exec-server", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_reviewer)
+    p = sub.add_parser("check", help="体检")
+    p.set_defaults(fn=cmd_check)
+    argv, cmd = sys.argv[1:], []
+    if argv[:1] == ["run"]:  # run 的命令写在 -- 后面，前面才是 aris-lab 自己的选项
+        if "--" not in argv:
+            sys.exit("用法：aris-lab run R001 [--milestone M0 --desc 说明 --group 配置] -- 命令 参数...（命令前面要有 --）")
+        i = argv.index("--")
+        argv, cmd = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    a.cmd = cmd
+    sys.exit(a.fn(a) or 0)
+
+
+if __name__ == "__main__":
+    main()
+EOF
+chmod +x "$BIN_DIR/aris-lab"
+
+# 注册 ARIS 的审稿工具 llm-chat（用户级 MCP）。Key 不写进配置文件：每次启动时从环境变量 LLM_* 读取
+if command -v claude >/dev/null 2>&1; then
+  claude mcp remove llm-chat -s user >/dev/null 2>&1 || true
+  claude mcp add llm-chat -s user -- "$BIN_DIR/aris-lab" reviewer --exec-server >/dev/null 2>&1 \
+    && log "llm-chat MCP registered" || log "llm-chat MCP registration failed"
+else
+  python3 - <<'PY'
+import json, os
+path = os.path.expanduser("~/.claude.json")
+cfg = json.load(open(path)) if os.path.exists(path) else {}
+cfg.setdefault("mcpServers", {})["llm-chat"] = {"type": "stdio", "command": os.environ["BIN_DIR"] + "/aris-lab",
+                                               "args": ["reviewer", "--exec-server"], "env": {}}
+json.dump(cfg, open(path, "w"), indent=2)
+PY
+fi
+
 # 注册为用户级 Stop hook（所有项目生效；只改 hooks.Stop，保留 settings.json 里其他设置）
 python3 - <<'PY'
 import json, os
@@ -1271,10 +2460,12 @@ path = os.path.expanduser("~/.claude/settings.json")
 cfg = json.load(open(path)) if os.path.exists(path) else {}
 stop = cfg.setdefault("hooks", {}).setdefault("Stop", [])
 bin_dir = os.environ.get("BIN_DIR", "/usr/local/bin")
-wanted = (f"{bin_dir}/chat-export --source user", f"{bin_dir}/research-site publish --auto >/dev/null 2>&1 || true")
+wanted = (f"{bin_dir}/chat-export --source user", f"{bin_dir}/research-site publish --auto >/dev/null 2>&1 || true",
+          f"{bin_dir}/aris-lab publish --auto >/dev/null 2>&1 || true")
 # 去掉旧版本注册的同名 hook，再按当前路径注册
 stop[:] = [e for e in stop if not any(("chat-export --source user" in h.get("command", "")
-                                        or "research-site publish --auto" in h.get("command", ""))
+                                        or "research-site publish --auto" in h.get("command", "")
+                                        or "aris-lab publish --auto" in h.get("command", ""))
                                        and h.get("command") not in wanted for h in e.get("hooks", []))]
 for cmd in wanted:
     if not any(h.get("command") == cmd for e in stop for h in e.get("hooks", [])):
@@ -1320,6 +2511,16 @@ block = """<!-- BEGIN cloud-setup -->
   3. 分析写进 `research-site set ID analysis`（Markdown），要点写进 `conclusions`；调研结束时 `research-site set ID status done`。
   4. 最后运行 `research-site publish -m "research: <标题>"`，并在回复里写一行：「✅ 调研网站已更新：<提交号> · <标题> · 共 N 条来源 · research/<ID>.html」。
 - 回复结束后 Stop hook 会运行 `research-site publish --auto`，把漏发布的 `research/` 改动补传上去，这只是兜底，不能代替第 4 步。
+
+## 自动跑实验（ARIS）
+
+- 用户要跑实验、做实验、用 ARIS 时：实验放在当前仓库的 `experiments/<项目名>/`（没有就先 `aris-lab new <项目名> --title "标题" --question "要回答的问题"`），进入那个文件夹，按它的 `CLAUDE.md` 做。
+- 流程：`/experiment-plan`（写计划）→ `/experiment-bridge`（写代码、审代码、先跑 sanity、再跑全部、收结果）→ `/analyze-results` → `/result-to-claim`；要多轮“审稿 → 补实验”时用 `/auto-review-loop`。
+- 每次正式运行都用 `aris-lab run <编号> --milestone … --desc … -- <命令>`：它记录日志和指标、更新看板（`DASHBOARD.md` / `.html`）并提交推送。
+- 每个新对话第一次跑实验前先运行 `aris-lab check`，把表格给用户看（审稿模型、算力是否就绪）。审稿模型没配置也照常跑，结果里写明“未经外部审稿”。
+- 云端容器没有 GPU，也不能 SSH 到别的服务器（只放行 HTTPS）；需要 GPU 时告诉用户：在有 GPU 的机器上装好这套配置并运行 Claude Code（`claude remote-control`），见 https://github.com/NNNoxin/claude-config 的「自动跑实验」一节。
+- 每批实验跑完，在回复里写一行：「🧪 实验看板已更新：<提交号> · <项目名> · 共 N 次运行 · experiments/<项目名>/DASHBOARD.md」。
+- 回复结束后 Stop hook 会运行 `aris-lab publish --auto`，把漏提交的 `experiments/` 改动补传上去，这只是兜底。
 <!-- END cloud-setup -->"""
 old = open(path).read() if os.path.exists(path) else ""
 pat = re.compile(r"<!-- BEGIN cloud-setup -->.*?<!-- END cloud-setup -->", re.S)
@@ -1331,5 +2532,5 @@ PY
 # 如果环境变量里已经有 Cookie，顺便导入（不影响快照的可用性）
 [ -n "${XHS_COOKIES:-}" ] && { printf '%s' "$XHS_COOKIES" | xhs-cookies-import || true; }
 
-log "done — run research-init in each new session"
+log "done — run research-init in each new session (aris-lab check for experiments)"
 exit 0
