@@ -81,6 +81,20 @@ curl -fsSL https://raw.githubusercontent.com/NNNoxin/claude-config/main/setup.sh
 要训练模型，就在有 GPU 的机器上：装 Claude Code → 运行上面的一键命令 → `git clone` 你的仓库 → 在仓库里运行 `claude remote-control`，
 然后在 Claude 网页或手机 App 里继续用，和云端一样。
 
+## 测试
+
+改了 `setup.sh` 里的 aris-lab 之后，先跑一遍测试再推送：
+
+```bash
+python3 tests/test_aris_lab.py              # 测 setup.sh 里的版本（约 10 秒，不联网）
+python3 tests/test_aris_lab.py --installed  # 测已经装好的 aris-lab 命令
+python3 tests/test_aris_lab.py --network    # 另外测审稿模型能不能连上（用假 Key，期望 401）
+```
+
+覆盖：新建项目、跑实验（完成 / 失败 / 超时 / 命令不存在 / 重复编号）、看板汇总和图表、24 个运行同时跑、
+提交前拦截密钥和大文件、改名、说明文档自动更新、审稿模型配置、体检。
+全部在临时目录里的假仓库中进行，不碰真实仓库和配置。最后一行显示“失败 0”就是全部通过。
+
 ## 在项目里开启对话记录
 
 对 Claude 说“**开启对话记录**”。Claude 会先确认仓库是私有的，再在仓库根目录创建 `.chat-export-on`。
