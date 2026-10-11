@@ -1296,7 +1296,7 @@ cat > "$BIN_DIR/aris-lab" <<'EOF'
 #!/usr/bin/env python3
 """aris-lab：配合 ARIS 自动跑实验的小工具。
 
-  aris-lab new 名字 [--title 标题] [--question 要回答的问题]
+  aris-lab new 名字 [--title 标题] [--question 要回答的问题] [--key-metrics 指标1,指标2]
         在 <当前仓库>/experiments/名字/ 新建实验项目（CLAUDE.md、目录结构、看板）
   aris-lab run 编号 [--milestone M1] [--desc 说明] [--group 配置名] [--timeout 秒]
                [--no-commit] [--force] -- 命令 参数...
@@ -1735,7 +1735,7 @@ LLM_API_KEY=你的 Key
 | 命令 | 作用 |
 |---|---|
 | `aris-lab check` | 体检：ARIS、审稿模型、算力 |
-| `aris-lab new <名字> --title "标题" --question "要回答的问题"` | 新建实验项目 |
+| `aris-lab new <名字> --title "标题" --question "要回答的问题" --key-metrics 指标1,指标2` | 新建实验项目（关键指标会排在看板最前面并画图；之后也可以改项目里的 `.aris-lab.json`） |
 | `aris-lab run R001 --milestone M0 --desc "说明" --group 配置名 -- python src/train.py --seed 0` | 跑一次实验：记录日志和指标、更新看板、提交推送 |
 | `aris-lab status` | 本项目所有运行的状态 |
 | `aris-lab report` | 重新生成看板 |
@@ -1772,6 +1772,8 @@ def cmd_new(a):
     title = a.title or name
     question = a.question or "（还没写：这个项目要回答什么问题？）"
     meta = {"name": name, "title": title, "question": question, "created": now("%Y-%m-%d %H:%M")}
+    if a.key_metrics:
+        meta["key_metrics"] = [k.strip() for k in a.key_metrics.split(",") if k.strip()]
     save_json(os.path.join(proj, MARK), meta)
     kw = dict(TITLE=title, NAME=name, QUESTION=question, HARDWARE=hw, NOW=now("%Y-%m-%d %H:%M"))
     for fn, tpl in (("CLAUDE.md", CLAUDE_MD), ("README.md", README_MD), ("EXPERIMENT_LOG.md", LOG_MD),
@@ -1802,6 +1804,14 @@ def kill_group(p):
             return
         except subprocess.TimeoutExpired:
             continue
+
+
+def say(*args, **kw):
+    """输出被提前关掉（比如接了 | head）时不报错，保证运行记录和提交照常完成。"""
+    try:
+        print(*args, **kw)
+    except (BrokenPipeError, OSError):
+        pass
 
 
 def cmd_run(a):
@@ -1839,7 +1849,7 @@ def cmd_run(a):
     if repo and not a.no_commit:  # 运行前先给代码拍快照，保证记录里的提交号就是跑出这个结果的代码
         sha, ok, warns = commit_paths(repo, code_paths, f"实验代码快照：{name} {rid} 运行前")
         for w in warns:
-            print(w, file=sys.stderr)
+            say(w, file=sys.stderr)
     head = git(repo, "rev-parse", "--short", "HEAD").stdout.strip() if repo else ""
     dirty = bool(git(repo, "status", "--porcelain", "--", *code_paths).stdout.strip()) if repo else False
     hw, _ = hardware()
@@ -1881,11 +1891,16 @@ def cmd_run(a):
                 timer = threading.Timer(a.timeout, on_timeout)
                 timer.daemon = True
                 timer.start()
+            echo = True
             for line in p.stdout:
                 log.write(line)
                 log.flush()
-                sys.stdout.write(line)
-                sys.stdout.flush()
+                if echo:
+                    try:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    except (BrokenPipeError, OSError):
+                        echo = False
                 if line.startswith("ARIS_RESULT "):
                     last = line[len("ARIS_RESULT "):].strip()
             code = p.wait()
@@ -1917,16 +1932,17 @@ def cmd_run(a):
     save_json(rec_path, rec)
     build_reports(proj)
 
-    key = ", ".join(f"{k}={fmt_num(v)}" for k, v in list(rec["metrics"].items())[:4])
-    print(f"\n[aris-lab] {rid} {STATUS[status]} · 用时 {fmt_dur(rec['duration_s'])}" + (f" · {key}" if key else ""))
+    shown = metric_keys([rec], key_metrics(meta))[:4]
+    key = ", ".join(f"{k}={fmt_num(rec['metrics'][k])}" for k in shown)
+    say(f"\n[aris-lab] {rid} {STATUS[status]} · 用时 {fmt_dur(rec['duration_s'])}" + (f" · {key}" if key else ""))
     if repo and not a.no_commit:
         rel = os.path.relpath(proj, repo)
         msg = f"实验 {name}/{rid}：{STATUS[status].split()[-1]}" + (f"（{key}）" if key else "")
         sha, ok, warns = commit_paths(repo, [rel, os.path.relpath(os.path.join(repo, "experiments"), repo)], msg)
         for w in warns:
-            print(w)
+            say(w)
         if sha:
-            print(f"[aris-lab] {'已推送' if ok else '已提交（推送失败，稍后 aris-lab publish 重试）'} {sha}：{msg}")
+            say(f"[aris-lab] {'已推送' if ok else '已提交（推送失败，稍后 aris-lab publish 重试）'} {sha}：{msg}")
     if status == "timeout":
         sys.exit(124)
     if status == "killed":
@@ -1955,13 +1971,19 @@ def load_runs(proj):
     return runs
 
 
-def metric_keys(runs):
+def metric_keys(runs, first=()):
+    """这些运行报告过的数值指标；first（项目的 key_metrics）里出现过的排在最前面。"""
     keys = []
     for r in runs:
         for k, v in (r.get("metrics") or {}).items():
             if k not in keys and isinstance(v, (int, float)) and not isinstance(v, bool):
                 keys.append(k)
-    return keys
+    return [k for k in first if k in keys] + [k for k in keys if k not in first]
+
+
+def key_metrics(meta):
+    km = meta.get("key_metrics") if isinstance(meta, dict) else None
+    return [str(k) for k in km] if isinstance(km, list) else []
 
 
 def aggregate(runs, keys):
@@ -2010,7 +2032,8 @@ def md_escape(s):
 
 
 def render_md(proj, meta, runs):
-    keys = metric_keys([r for r in runs if r.get("group") and r.get("status") == "done"])
+    first = key_metrics(meta)
+    keys = metric_keys([r for r in runs if r.get("group") and r.get("status") == "done"], first)
     agg = aggregate(runs, keys)
     c = counts(runs)
     L = [f"# 🧪 实验看板：{meta.get('title', meta.get('name'))}", "",
@@ -2041,7 +2064,7 @@ def render_md(proj, meta, runs):
     for r in runs:
         by_ms.setdefault(r.get("milestone") or "未分组", []).append(r)
     for ms in sorted(by_ms, key=natkey):
-        keys = metric_keys(by_ms[ms])
+        keys = metric_keys(by_ms[ms], first)
         L += [f"### {ms}", "", "| 编号 | 说明 | 状态 | 配置 | " + " | ".join(keys) + (" | " if keys else "") + "用时 | 日志 | 代码版本 |",
               "|---|---|---|---|" + "---:|" * len(keys) + "---|---|---|"]
         for r in by_ms[ms]:
@@ -2111,7 +2134,8 @@ def chart_svg(agg, key):
 
 
 def render_html(proj, meta, runs):
-    keys = metric_keys([r for r in runs if r.get("group") and r.get("status") == "done"])
+    first = key_metrics(meta)
+    keys = metric_keys([r for r in runs if r.get("group") and r.get("status") == "done"], first)
     agg = aggregate(runs, keys)
     c = counts(runs)
     title = meta.get("title", meta.get("name"))
@@ -2138,7 +2162,7 @@ def render_html(proj, meta, runs):
                     cells.append("<td></td>")
             P.append(f"<tr><td>{esc(row['group'])}</td><td class='num'>{row['n']}</td>{''.join(cells)}</tr>")
         P.append("</table></div>")
-        charts = [chart_svg(agg, k) for k in keys[:8]]
+        charts = [chart_svg(agg, k) for k in ([k for k in first if k in keys] or keys)[:8]]
         charts = [x for x in charts if x]
         if charts:
             P.append("<div class='charts'>" + "".join(f"<div class='card'>{x}</div>" for x in charts) + "</div>")
@@ -2149,7 +2173,7 @@ def render_html(proj, meta, runs):
     for r in runs:
         by_ms.setdefault(r.get("milestone") or "未分组", []).append(r)
     for ms in sorted(by_ms, key=natkey):
-        keys = metric_keys(by_ms[ms])
+        keys = metric_keys(by_ms[ms], first)
         P.append(f"<h3>{esc(ms)}</h3><div class='card tbl'><table><tr><th>编号</th><th>说明</th><th>状态</th><th>配置</th>"
                  + "".join(f"<th class='num'>{esc(k)}</th>" for k in keys) + "<th>用时</th><th>日志</th><th>代码版本</th></tr>")
         for r in by_ms[ms]:
@@ -2229,7 +2253,7 @@ def cmd_report(a):
 def cmd_status(a):
     proj = need_project(a)
     runs = load_runs(proj)
-    keys = metric_keys(runs)[:4]
+    keys = metric_keys(runs, key_metrics(load_json(os.path.join(proj, MARK), {})))[:4]
     if not runs:
         print("还没有运行。")
         return
@@ -2422,6 +2446,7 @@ def main():
     p.add_argument("name")
     p.add_argument("--title")
     p.add_argument("--question")
+    p.add_argument("--key-metrics", help="逗号分隔的关键指标名；看板图表、列顺序和提交说明优先显示它们（之后也可以改 .aris-lab.json）")
     p.set_defaults(fn=cmd_new)
     p = sub.add_parser("run", help="跑一次实验并记录")
     p.add_argument("run_id")
@@ -2451,6 +2476,8 @@ def main():
     p = sub.add_parser("check", help="体检")
     p.set_defaults(fn=cmd_check)
     argv, cmd = sys.argv[1:], []
+    if argv[:1] != ["run"]:  # 查看类命令接 | head 时安静退出；run 自己处理，保证记录写完
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     if argv[:1] == ["run"]:  # run 的命令写在 -- 后面，前面才是 aris-lab 自己的选项
         if "--" not in argv:
             sys.exit("用法：aris-lab run R001 [--milestone M0 --desc 说明 --group 配置] -- 命令 参数...（命令前面要有 --）")
