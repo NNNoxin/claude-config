@@ -1296,8 +1296,8 @@ cat > "$BIN_DIR/aris-lab" <<'EOF'
 #!/usr/bin/env python3
 """aris-lab：配合 ARIS 自动跑实验的小工具。
 
-  aris-lab new 名字 [--title 标题] [--question 要回答的问题] [--key-metrics 指标1,指标2]
-        在 <当前仓库>/experiments/名字/ 新建实验项目（CLAUDE.md、目录结构、看板）
+  aris-lab new 名字 [--title 标题] [--question 要回答的问题] [--key-metrics 指标1,指标2] [--no-commit]
+        在 <当前仓库>/experiments/名字/ 新建实验项目（CLAUDE.md、目录结构、看板）并提交推送
   aris-lab run 编号 [--milestone M1] [--desc 说明] [--group 配置名] [--timeout 秒]
                [--no-commit] [--force] -- 命令 参数...
         跑一次实验：保存完整日志、记录指标、更新看板、提交并推送
@@ -1420,9 +1420,11 @@ def fmt_num(v):
     a = abs(v)
     if a >= 1000:
         return f"{v:,.1f}"
-    if a >= 1:
+    if a >= 10:
         return f"{v:.3f}"
-    return f"{v:.4f}"
+    if a >= 1e-3 or a == 0:
+        return f"{v:.4f}"
+    return f"{v:.2e}"
 
 
 def fmt_dur(s):
@@ -1660,33 +1662,25 @@ logs/*.prev
 """
 
 
-EXP_README = """# 🧪 实验区（ARIS 自动跑实验）
-
-这里放用 [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep) 自动跑的实验。每个子文件夹是一个实验项目，有自己的计划、代码、运行记录和看板。
-
-## 实验项目
-
-<!-- BEGIN aris-lab projects -->
-<!-- END aris-lab projects -->
-
+EXP_GUIDE = """<!-- 这一段由 aris-lab 自动更新（改了会被覆盖）；自己的说明请写在这一段外面 -->
 ## 怎么用：对 Claude 说一句话
 
 在 Claude Code 里打开这个仓库，说：
 
 > 用 ARIS 跑实验：<你的想法，或者要验证的问题>
 
-Claude 会按下面的步骤自动做完，每一步都提交到 GitHub：
+Claude 会按下面的步骤自动做完，并按自动保存规则把每一步提交到 GitHub：
 
 | 步骤 | 做什么 | 产出 |
 |---|---|---|
-| 1. 建项目 | `aris-lab new <名字>` | `experiments/<名字>/` |
+| 1. 建项目 | `aris-lab new <名字>`（会自动提交） | `experiments/<名字>/` |
 | 2. 写计划 | `/experiment-plan`：把想法拆成要证明的结论（claim）和对应的实验 | `refine-logs/EXPERIMENT_PLAN.md` |
 | 3. 写代码 | `/experiment-bridge`：按计划写实验代码 | `src/` |
 | 4. 审代码 | 审稿模型检查代码有没有 bug（没配置审稿模型就跳过） | 审稿记录 |
 | 5. 小测试 | 先跑最小的 sanity check，确认整条流程能跑通 | `runs/R001.json` |
 | 6. 正式跑 | 基线 → 主实验 → 消融，多个随机种子 | `runs/`、`results/`、`logs/` |
-| 7. 汇总 | 自动生成看板：每次运行的指标、按配置的均值 ± 标准差、柱状图 | `DASHBOARD.md`、`DASHBOARD.html` |
-| 8. 下结论 | `/analyze-results`、`/result-to-claim`：结果能支持哪些结论、还缺什么 | `EXPERIMENT_LOG.md` |
+| 7. 汇总 | 自动生成看板：每次运行的指标、同一配置的均值 ± 标准差、柱状图 | `DASHBOARD.md`、`DASHBOARD.html` |
+| 8. 下结论 | `/analyze-results`、`/result-to-claim`：结果能支持哪些结论、还缺什么 | `ANALYSIS.md`、`EXPERIMENT_LOG.md` |
 | 9. 改进（可选） | `/auto-review-loop`：审稿 → 补实验 → 再审，循环几轮 | `review-stage/` |
 
 也可以只做其中一步，比如“把 R003 的配置再跑 5 个 seed”“看看这个项目的结果说明了什么”。
@@ -1710,7 +1704,7 @@ LLM_API_KEY=你的 Key
 | OpenRouter | `openrouter` | openrouter.ai → Keys | 按量付费，一个 Key 用多家模型 |
 | OpenAI、Gemini、Kimi、智谱、通义、硅基流动 | `openai` / `gemini` / `moonshot` / `zhipu` / `dashscope` / `siliconflow` | 各平台控制台 | 还要加一行 `LLM_MODEL=模型名` |
 
-保存后**新开一个对话**，说“检查实验环境”。Claude 会运行 `aris-lab check`，表格里“审稿模型”一行是 ✅ 就好了。
+保存后**新开一个对话**，说“检查实验环境”。Claude 会运行 `aris-lab check`，表格里“审稿模型”一行是 ✅ 就好了（“Codex 审稿”一行显示 ➖ 不用管，那是可选项）。
 不配也能跑实验，只是没有外部审稿，结果里会写明“未经外部审稿”。
 
 > Key 只放在环境变量里，不要贴进聊天，也不要写进代码。aris-lab 提交前会自动拦下含疑似密钥的文件。
@@ -1726,28 +1720,55 @@ LLM_API_KEY=你的 Key
 
 ## 看结果
 
-- 每个项目的 `DASHBOARD.md`：在 GitHub 网页上直接看（每次运行的指标，按配置的均值 ± 标准差）。
+- 每个项目的 `DASHBOARD.md`：在 GitHub 网页上直接看。上面是“按配置汇总”：同一个配置名（`--group`）的多次运行合并成“均值 ± 标准差”一行；没有配置名的运行只出现在下面的“全部运行”表里。
 - `DASHBOARD.html`：带柱状图的网页版，下载后用浏览器打开；这里的 `index.html` 是所有项目的总览。
+- 看板上的数字是四舍五入过的；精确值看 `results/<编号>.json`。
 - 每次运行：完整输出在 `logs/<编号>.log`，指标在 `results/<编号>.json`，命令、时间、代码版本在 `runs/<编号>.json`。
 
 ## 常用命令（Claude 会自己用，你也可以在终端里用）
 
+`check` 和 `new` 在仓库里任何位置都能运行；其余命令要在项目文件夹里运行：先 `cd experiments/<名字>/`（或者加 `--project experiments/<名字>`）。命令里的路径（比如 `src/train.py`）也是相对项目文件夹的。
+
 | 命令 | 作用 |
 |---|---|
 | `aris-lab check` | 体检：ARIS、审稿模型、算力 |
-| `aris-lab new <名字> --title "标题" --question "要回答的问题" --key-metrics 指标1,指标2` | 新建实验项目（关键指标会排在看板最前面并画图；之后也可以改项目里的 `.aris-lab.json`） |
-| `aris-lab run R001 --milestone M0 --desc "说明" --group 配置名 -- python src/train.py --seed 0` | 跑一次实验：记录日志和指标、更新看板、提交推送 |
+| `aris-lab new <名字> --title "标题" --question "要回答的问题" --key-metrics 指标1,指标2` | 新建实验项目并提交（关键指标排在看板最前面并画图；之后也可以改项目里的 `.aris-lab.json`） |
+| `aris-lab run R001 --milestone M0 --desc "说明" --group 配置名 -- .venv/bin/python src/train.py --seed 0` | 跑一次实验：记录日志和指标、更新看板、提交推送 |
 | `aris-lab status` | 本项目所有运行的状态 |
-| `aris-lab report` | 重新生成看板 |
-| `aris-lab publish -m "说明"` | 提交并推送实验区的改动 |
+| `aris-lab report` | 重新生成看板（只改本地文件，不提交） |
+| `aris-lab publish -m "说明"` | 提交并推送实验区的所有改动（`report` 之后、手动改了文件之后用） |
+
+`aris-lab run` 的参数：
+
+- **编号**（如 R001）：每次运行用一个新编号（R001、R002……）；同一配置重跑用 R001b。已经跑完的编号不能覆盖，除非加 `--force`。
+- **`--milestone`**：阶段标签，比如 M0 小测试、M1 主实验、M2 消融；看板按它分节。
+- **`--group`**：配置名。同一配置的不同随机种子用同一个名字，看板才会合并算均值 ± 标准差。
+- **`--no-commit`**：批量跑时先不提交，整批跑完再 `aris-lab publish`。
+- **`--timeout 秒数`**：超过这个时间自动停掉。
 
 ## 实验脚本的约定
 
 - 超参数都用命令行参数（argparse），随机种子可以设置。
-- 结果写进环境变量 `ARIS_RESULT_FILE` 指向的 JSON：`{"metrics": {"acc": 0.93}, "config": {"lr": 0.001}}`。
+- 结果写进环境变量 `ARIS_RESULT_FILE` 指向的 JSON：`{"metrics": {"acc": 0.93}, "config": {"lr": 0.001}}`。这个环境变量只有用 `aris-lab run` 启动时才有，脚本里写成 `os.environ.get("ARIS_RESULT_FILE", "result.json")`，直接运行调试也不会出错。
+- 可选：JSON 里加 `"group": "配置名"`，效果和 `--group` 一样。
+- 依赖装在项目自己的环境里：`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`，运行时写 `-- .venv/bin/python src/train.py`（`.venv` 不进 git）。
 - 评估用数据集自带的真实标签，不能拿别的模型的输出当标准答案。
 - 数据集、模型权重、checkpoint 不进 git；结果、日志、看板进 git。
 """
+
+EXP_HEADER = """# 🧪 实验区（ARIS 自动跑实验）
+
+这里放用 [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep) 自动跑的实验。每个子文件夹是一个实验项目，有自己的计划、代码、运行记录和看板。
+
+## 实验项目
+
+<!-- BEGIN aris-lab projects -->
+<!-- END aris-lab projects -->
+
+"""
+
+GUIDE_BLOCK = "<!-- BEGIN aris-lab guide -->\n" + EXP_GUIDE + "<!-- END aris-lab guide -->"
+EXP_README = EXP_HEADER + GUIDE_BLOCK + "\n"
 
 
 def fill(tpl, **kw):
@@ -1785,6 +1806,13 @@ def cmd_new(a):
     build_reports(proj)
     rel = os.path.relpath(proj, root)
     print(f"已创建实验项目：{rel}/")
+    repo = git_root(proj)
+    if repo and not a.no_commit:
+        sha, ok, warns = commit_paths(repo, [os.path.relpath(proj, repo), "experiments"], f"实验 {name}：新建实验项目")
+        for w in warns:
+            print(w)
+        if sha:
+            print(f"  {'已推送' if ok else '已提交（推送失败，稍后 aris-lab publish 重试）'} {sha}")
     print(f"  算力：{hw}")
     print("下一步：")
     print(f"  1. cd {rel}")
@@ -2213,6 +2241,8 @@ def build_index(exp_dir):
     old = open(readme, encoding="utf-8").read() if os.path.exists(readme) else EXP_README
     pat = re.compile(r"<!-- BEGIN aris-lab projects -->.*?<!-- END aris-lab projects -->", re.S)
     new = pat.sub(lambda _: block, old) if pat.search(old) else old.rstrip() + "\n\n" + block + "\n"
+    gpat = re.compile(r"<!-- BEGIN aris-lab guide -->.*?<!-- END aris-lab guide -->", re.S)
+    new = gpat.sub(lambda _: GUIDE_BLOCK, new)  # 使用说明跟着 aris-lab 版本自动更新；区块外的内容不动
     write_if_changed(readme, new)
     H = ["<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
          f"<title>实验总览</title><style>{CSS}</style></head><body><div class='wrap'><h1>🧪 实验总览</h1>",
@@ -2388,7 +2418,7 @@ def cmd_check(a):
     rows = []
     here = git_root()
     doc = ("experiments/README.md" if here and os.path.exists(os.path.join(here, "experiments", "README.md"))
-           else "github.com/NNNoxin/claude-config 的「自动跑实验」")
+           else "aris-lab new 之后生成的 experiments/README.md，或 github.com/NNNoxin/claude-config")
     repo = os.path.join(HOME, "aris_repo")
     if os.path.exists(os.path.join(HOME, ".aris", "repo")):
         repo = open(os.path.join(HOME, ".aris", "repo")).read().strip() or repo
@@ -2413,7 +2443,7 @@ def cmd_check(a):
         rows.append(("审稿模型", "✅" if ok else "❌", msg))
     rows.append(("审稿工具注册", "✅" if mcp_registered("llm-chat") else "❌",
                  "llm-chat（ARIS 需要审稿时调用；新对话生效）" if mcp_registered("llm-chat") else "没注册：重跑 setup.sh"))
-    rows.append(("Codex 审稿", "✅" if shutil.which("codex") else "🚫", "已安装" if shutil.which("codex") else "没装（可选，需要 ChatGPT 账号；没有就用上面的审稿模型）"))
+    rows.append(("Codex 审稿", "✅" if shutil.which("codex") else "➖", "已安装" if shutil.which("codex") else "可选，没装不影响（有 ChatGPT 账号才用得上；没有就用上面的审稿模型）"))
     hw, gpus = hardware()
     rows.append(("算力", "✅" if gpus else "ℹ️", hw + ("" if gpus else f"：适合 CPU 小实验和调 API 的实验；要 GPU 见 {doc}")))
     try:
@@ -2446,6 +2476,7 @@ def main():
     p.add_argument("name")
     p.add_argument("--title")
     p.add_argument("--question")
+    p.add_argument("--no-commit", action="store_true", help="只在本地创建，不提交")
     p.add_argument("--key-metrics", help="逗号分隔的关键指标名；看板图表、列顺序和提交说明优先显示它们（之后也可以改 .aris-lab.json）")
     p.set_defaults(fn=cmd_new)
     p = sub.add_parser("run", help="跑一次实验并记录")
@@ -2573,7 +2604,7 @@ block = """<!-- BEGIN cloud-setup -->
 - 用户要跑实验、做实验、用 ARIS 时：实验放在当前仓库的 `experiments/<项目名>/`（没有就先 `aris-lab new <项目名> --title "标题" --question "要回答的问题"`），进入那个文件夹，按它的 `CLAUDE.md` 做。
 - 流程：`/experiment-plan`（写计划）→ `/experiment-bridge`（写代码、审代码、先跑 sanity、再跑全部、收结果）→ `/analyze-results` → `/result-to-claim`；要多轮“审稿 → 补实验”时用 `/auto-review-loop`。
 - 每次正式运行都用 `aris-lab run <编号> --milestone … --desc … -- <命令>`：它记录日志和指标、更新看板（`DASHBOARD.md` / `.html`）并提交推送。
-- 每个新对话第一次跑实验前先运行 `aris-lab check`，把表格给用户看（审稿模型、算力是否就绪）。审稿模型没配置也照常跑，结果里写明“未经外部审稿”。
+- 用户说“检查实验环境”，或者每个新对话第一次跑实验之前，运行 `aris-lab check`，把表格给用户看（审稿模型、算力是否就绪）。审稿模型没配置也照常跑，结果里写明“未经外部审稿”。
 - 云端容器没有 GPU，也不能 SSH 到别的服务器（只放行 HTTPS）；需要 GPU 时告诉用户：在有 GPU 的机器上装好这套配置并运行 Claude Code（`claude remote-control`），见 https://github.com/NNNoxin/claude-config 的「自动跑实验」一节。
 - 每批实验跑完，在回复里写一行：「🧪 实验看板已更新：<提交号> · <项目名> · 共 N 次运行 · experiments/<项目名>/DASHBOARD.md」。
 - 回复结束后 Stop hook 会运行 `aris-lab publish --auto`，把漏提交的 `experiments/` 改动补传上去，这只是兜底。
