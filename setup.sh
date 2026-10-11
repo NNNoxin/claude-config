@@ -1446,6 +1446,23 @@ def pid_alive(pid):
         return False
 
 
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def run_alive(r):
+    """记录里 running 的运行是否还活着：True / False / None（在别的机器上启动，无法判断）。"""
+    if r.get("boot_id") and boot_id() and r["boot_id"] != boot_id():
+        return False  # 机器重启过或换了容器，进程不可能还在
+    if r.get("host") and r["host"] != socket.gethostname():
+        return None
+    return pid_alive(r.get("pid"))
+
+
 def hardware():
     gpus = []
     if shutil.which("nvidia-smi"):
@@ -1799,8 +1816,11 @@ def cmd_run(a):
     rec_path = os.path.join(proj, "runs", f"{rid}.json")
     old = load_json(rec_path)
     if old:
-        if old.get("status") == "running" and old.get("host") == socket.gethostname() and pid_alive(old.get("pid")):
-            sys.exit(f"{rid} 正在运行（pid {old['pid']}），换一个编号或等它结束")
+        alive = run_alive(old) if old.get("status") == "running" else False
+        if alive and not a.force:
+            sys.exit(f"{rid} 正在运行（pid {old.get('pid')}），换一个编号或等它结束")
+        if alive is None and not a.force:
+            sys.exit(f"{rid} 记录显示正在 {old.get('host')} 上运行，这里无法确认；确定它已经停了就加 --force")
         if old.get("status") == "done" and not a.force:
             sys.exit(f"{rid} 已经跑完了；重跑请换编号（如 {rid}b），确实要覆盖就加 --force")
     log_rel, res_rel = f"logs/{rid}.log", f"results/{rid}.json"
@@ -1842,7 +1862,7 @@ def cmd_run(a):
             code, state["status"] = 127, "failed"
             rec["note"] = f"无法启动命令：{e}"
         if p:
-            rec["pid"] = p.pid
+            rec.update(pid=os.getpid(), child_pid=p.pid, boot_id=boot_id())  # 用 aris-lab 自己的进程判断是否还在跑
             save_json(rec_path, rec)
             build_reports(proj)
 
@@ -1890,7 +1910,8 @@ def cmd_run(a):
     if status == "done" and not rec["metrics"]:
         rec["note"] = rec["note"] or "脚本没有写出指标（ARIS_RESULT_FILE 或 ARIS_RESULT 行）"
     rec.update(status=status, exit_code=code, finished=now(), duration_s=round(time.time() - t0, 1))
-    rec.pop("pid", None)
+    for k in ("pid", "child_pid", "boot_id"):
+        rec.pop(k, None)
     save_json(rec_path, rec)
     build_reports(proj)
 
@@ -1913,16 +1934,20 @@ def cmd_run(a):
 
 # ---------- 看板 ----------
 def load_runs(proj):
+    """读取全部运行记录。只在内存里把“进程已不在”的运行显示成中断，不写回文件，
+    免得和正在收尾的 aris-lab run 抢着写同一个记录。"""
     runs = []
-    host = socket.gethostname()
     for path in glob.glob(os.path.join(proj, "runs", "*.json")):
         r = load_json(path)
         if not isinstance(r, dict) or "run_id" not in r:
             continue
-        if r.get("status") == "running" and r.get("host") == host and not pid_alive(r.get("pid")):
-            r["status"] = "lost"
-            r["note"] = r.get("note") or "进程已不在（容器重启或被杀掉），没有正常结束"
-            save_json(path, r)
+        if r.get("status") == "running":
+            alive = run_alive(r)
+            if alive is False:
+                r["status"] = "lost"
+                r["note"] = r.get("note") or "进程已不在（容器重启或被杀掉），没有正常结束"
+            elif alive is None:
+                r["note"] = r.get("note") or f"在 {r.get('host')} 上启动，这台机器看不到它的状态"
         runs.append(r)
     runs.sort(key=lambda r: natkey(r["run_id"]))
     return runs
