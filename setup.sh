@@ -1615,7 +1615,7 @@ last_updated: "{{NOW}}"
 4. 评估必须用数据集自带的真实标签，不能拿别的模型的输出当标准答案（ARIS 的硬规则）。
 5. 多个 seed 或网格批量跑：同一配置用同一个 `--group`，看板自动算均值 ± 标准差；批量时可以加 `--no-commit`，整批跑完再 `aris-lab publish -m "实验：<说明>"` 一次提交。并行数不要超过 CPU 核数。
 6. 数据集、模型权重、checkpoint 不进 git（`.gitignore` 已写好）；`runs/`（运行记录）、`results/`（指标）、`logs/`（日志）和看板进 git。
-7. ARIS skill 里有 `cd "$(git rev-parse --show-toplevel …)"` 的命令块时，用子 shell `( … )` 包起来，保证当前目录一直是这个项目文件夹（ARIS 的产出都写在这里）。
+7. ARIS 的产出都写在这个项目文件夹里：每条命令先 `cd` 到这里（或者给 aris-lab 加 `--project <路径>`）；ARIS skill 里有 `cd "$(git rev-parse --show-toplevel …)"` 的命令块时，用子 shell `( … )` 包起来跑。
 8. 每批实验跑完，在回复里写一行：「🧪 实验看板已更新：<提交号> · {{NAME}} · 共 N 次运行 · experiments/{{NAME}}/DASHBOARD.md」。
 
 ## 审稿模型（Reviewer）
@@ -1832,14 +1832,16 @@ def cmd_run(a):
 
     repo = git_root(proj)
     name = meta.get("name") or os.path.basename(proj)
-    if repo and not a.no_commit:  # 运行前先给代码拍快照，保证记录里的提交号就是跑出这个结果的代码
+    code_paths = []  # 项目里除运行记录、结果、日志、看板以外的文件（也就是代码和文档）
+    if repo:
         rel = os.path.relpath(proj, repo)
-        excl = [f":(exclude){rel}/{d}" for d in ("runs", "results", "logs")]
-        sha, ok, warns = commit_paths(repo, [rel, *excl], f"实验代码快照：{name} {rid} 运行前")
+        code_paths = [rel] + [f":(exclude){rel}/{d}" for d in ("runs", "results", "logs", "DASHBOARD.md", "DASHBOARD.html")]
+    if repo and not a.no_commit:  # 运行前先给代码拍快照，保证记录里的提交号就是跑出这个结果的代码
+        sha, ok, warns = commit_paths(repo, code_paths, f"实验代码快照：{name} {rid} 运行前")
         for w in warns:
             print(w, file=sys.stderr)
     head = git(repo, "rev-parse", "--short", "HEAD").stdout.strip() if repo else ""
-    dirty = bool(git(repo, "status", "--porcelain", "--", proj).stdout.strip()) if repo else False
+    dirty = bool(git(repo, "status", "--porcelain", "--", *code_paths).stdout.strip()) if repo else False
     hw, _ = hardware()
     rec = {"run_id": rid, "milestone": a.milestone or "", "desc": a.desc or "", "group": a.group or "",
            "command": shlex.join(cmd), "workdir": os.path.relpath(os.getcwd(), proj),
@@ -2008,7 +2010,7 @@ def md_escape(s):
 
 
 def render_md(proj, meta, runs):
-    keys = metric_keys(runs)
+    keys = metric_keys([r for r in runs if r.get("group") and r.get("status") == "done"])
     agg = aggregate(runs, keys)
     c = counts(runs)
     L = [f"# 🧪 实验看板：{meta.get('title', meta.get('name'))}", "",
@@ -2039,6 +2041,7 @@ def render_md(proj, meta, runs):
     for r in runs:
         by_ms.setdefault(r.get("milestone") or "未分组", []).append(r)
     for ms in sorted(by_ms, key=natkey):
+        keys = metric_keys(by_ms[ms])
         L += [f"### {ms}", "", "| 编号 | 说明 | 状态 | 配置 | " + " | ".join(keys) + (" | " if keys else "") + "用时 | 日志 | 代码版本 |",
               "|---|---|---|---|" + "---:|" * len(keys) + "---|---|---|"]
         for r in by_ms[ms]:
@@ -2108,7 +2111,7 @@ def chart_svg(agg, key):
 
 
 def render_html(proj, meta, runs):
-    keys = metric_keys(runs)
+    keys = metric_keys([r for r in runs if r.get("group") and r.get("status") == "done"])
     agg = aggregate(runs, keys)
     c = counts(runs)
     title = meta.get("title", meta.get("name"))
@@ -2146,6 +2149,7 @@ def render_html(proj, meta, runs):
     for r in runs:
         by_ms.setdefault(r.get("milestone") or "未分组", []).append(r)
     for ms in sorted(by_ms, key=natkey):
+        keys = metric_keys(by_ms[ms])
         P.append(f"<h3>{esc(ms)}</h3><div class='card tbl'><table><tr><th>编号</th><th>说明</th><th>状态</th><th>配置</th>"
                  + "".join(f"<th class='num'>{esc(k)}</th>" for k in keys) + "<th>用时</th><th>日志</th><th>代码版本</th></tr>")
         for r in by_ms[ms]:
